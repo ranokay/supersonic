@@ -188,6 +188,7 @@ func NewMainWindow(fyneApp fyne.App, appName, displayAppName, appVersion string,
 		if (runtime.GOOS == "darwin" && !isRealQuit()) || (app.Config.Application.CloseToSystemTray && m.HaveSystemTray()) {
 			m.Window.Hide()
 		} else {
+			m.BottomPanel.Stop()
 			m.Window.Close()
 		}
 	})
@@ -582,6 +583,9 @@ func (m *MainWindow) SetContent(c fyne.CanvasObject) {
 
 func (m *MainWindow) Quit() {
 	m.SaveWindowSettings()
+	if m.BottomPanel != nil {
+		m.BottomPanel.Stop()
+	}
 	fyne.CurrentApp().Quit()
 }
 

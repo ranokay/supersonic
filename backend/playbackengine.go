@@ -12,7 +12,6 @@ import (
 
 	"github.com/dweymouth/supersonic/backend/mediaprovider"
 	"github.com/dweymouth/supersonic/backend/player"
-	"github.com/dweymouth/supersonic/backend/player/mpv"
 	"github.com/dweymouth/supersonic/backend/util"
 	"github.com/dweymouth/supersonic/sharedutil"
 )
@@ -90,11 +89,12 @@ type playbackEngine struct {
 	// and reset this to -1
 	pendingTrackChangeNum int
 
-	pendingPlayerChange       bool
-	pendingPlayerChangeStatus player.Status
+	pendingPlayerChange         bool
+	pendingPlayerChangeStatus   player.Status
+	firstPlaybackPositionLogged bool
 
 	// set when restoring session state: track is conceptually loaded+paused
-	// but MPV hasn't been touched yet; cleared on Continue or playTrackAt
+	// but the local player hasn't been touched yet; cleared on Continue or playTrackAt
 	pendingLoadPaused    bool
 	pendingLoadStartTime float64
 
@@ -184,6 +184,7 @@ func (p *playbackEngine) registerPlayerCallbacks(pl player.BasePlayer) {
 		p.reportPlayback("paused")
 	})
 	pl.OnPlaying(func() {
+		audioDebugf("OnPlaying idx=%d", p.nowPlayingIdx)
 		p.playTimeStopwatch.Start()
 		p.startPollTimePos()
 		p.invokeNoArgCallbacks(p.onPlaying)
@@ -228,7 +229,7 @@ func (p *playbackEngine) SetPlayer(pl player.BasePlayer) error {
 	}
 
 	oldVol := p.player.GetVolume()
-	if _, isMPV := p.player.(*mpv.Player); !isMPV {
+	if _, isLocal := p.player.(player.LocalPlayer); !isLocal {
 		p.player.Destroy()
 	}
 	p.player = pl
@@ -464,6 +465,9 @@ func (p *playbackEngine) PlaybackStatus() PlaybackStatus {
 }
 
 func (p *playbackEngine) SetVolume(vol int) error {
+	if p.softwareVolumeLocked() {
+		return nil
+	}
 	vol = clamp(vol, 0, 100)
 	if err := p.player.SetVolume(vol); err != nil {
 		return err
@@ -472,6 +476,15 @@ func (p *playbackEngine) SetVolume(vol int) error {
 		cb(vol)
 	}
 	return nil
+}
+
+func (p *playbackEngine) softwareVolumeLocked() bool {
+	localPlayer, ok := p.player.(player.LocalPlayer)
+	if !ok {
+		return false
+	}
+	info, err := localPlayer.GetMediaInfo()
+	return err == nil && info.SoftwareVolumeLocked
 }
 
 func (p *playbackEngine) CurrentPlayer() player.BasePlayer {
@@ -972,15 +985,28 @@ func (p *playbackEngine) nextPlayingIndex() int {
 }
 
 func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
+	span := startAudioDebugSpan("setTrack", "idx", idx, "next", next, "startTime", startTime)
+	defer span.Done()
+	if !next {
+		p.firstPlaybackPositionLogged = false
+	}
 	var item mediaprovider.MediaItem
 	var url string
 	if idx >= 0 {
 		item = p.getPlayQueueItemAt(idx)
+		urlSpan := startAudioDebugSpan("getStreamURL", "idx", idx)
 		url = p.getMediaURLForIdx(idx)
+		urlSpan.Done("hasURL", url != "")
 	}
-	track, isTrack := item.(*mediaprovider.Track)
+	var track *mediaprovider.Track
+	var isTrack bool
+	if item != nil {
+		track, isTrack = item.(*mediaprovider.Track)
+	}
 	if p.audiocache != nil && isTrack {
-		p.audiocache.CacheFile(item.Metadata().ID, p.getMediaURLForIdx(idx))
+		cacheSpan := startAudioDebugSpan("cacheFile", "idx", idx, "track", item.Metadata().ID)
+		p.audiocache.CacheFile(item.Metadata().ID, url)
+		cacheSpan.Done()
 	}
 
 	if urlP, ok := p.player.(player.URLPlayer); ok {
@@ -990,10 +1016,13 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 			if isTrack && p.audiocache != nil {
 				if filepath := p.audiocache.PathForCachedFile(track.ID); filepath != "" {
 					url = filepath
+					audioDebugf("cache hit idx=%d path=%s", idx, filepath)
+				} else {
+					audioDebugf("cache miss idx=%d", idx)
 				}
 			}
-			if mpvP, ok := p.player.(*mpv.Player); ok && !isTrack {
-				mpvP.ObserveIcyRadioTitle(func(icytitle string) {
+			if lpP, ok := p.player.(player.LocalPlayer); ok && !isTrack {
+				lpP.ObserveIcyRadioTitle(func(icytitle string) {
 					var title, artist string
 					if s := strings.Split(icytitle, " - "); len(s) == 2 {
 						title, artist = s[1], s[0]
@@ -1005,16 +1034,22 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 					}
 				})
 			} else if ok {
-				mpvP.UnobserveIcyRadioTitle()
+				lpP.UnobserveIcyRadioTitle()
 			}
 			if url == "" {
 				return errors.New("no stream URL")
 			}
 		}
 		if next {
-			return urlP.SetNextFile(url, meta)
+			nextSpan := startAudioDebugSpan("SetNextFile", "idx", idx)
+			err := urlP.SetNextFile(url, meta)
+			nextSpan.Done("err", err)
+			return err
 		}
-		return urlP.PlayFile(url, meta, startTime)
+		playSpan := startAudioDebugSpan("PlayFile", "idx", idx)
+		err := urlP.PlayFile(url, meta, startTime)
+		playSpan.Done("err", err)
+		return err
 	} else if trP, ok := p.player.(player.TrackPlayer); ok {
 		var track *mediaprovider.Track
 		if idx >= 0 {
@@ -1024,9 +1059,15 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 			}
 		}
 		if next {
-			return trP.SetNextTrack(track)
+			nextSpan := startAudioDebugSpan("SetNextTrack", "idx", idx)
+			err := trP.SetNextTrack(track)
+			nextSpan.Done("err", err)
+			return err
 		}
-		return trP.PlayTrack(track, startTime)
+		playSpan := startAudioDebugSpan("PlayTrack", "idx", idx)
+		err := trP.PlayTrack(track, startTime)
+		playSpan.Done("err", err)
+		return err
 	}
 	panic("Unsupported player type")
 }
@@ -1148,6 +1189,10 @@ func (pm *playbackEngine) invokeNoArgCallbacks(cbs []func()) {
 }
 
 func (p *playbackEngine) startPollTimePos() {
+	if p.cancelPollPos != nil {
+		return // already polling
+	}
+
 	ctx, cancel := context.WithCancel(p.ctx)
 	p.cancelPollPos = cancel
 	pollFrequency := 250 * time.Millisecond
@@ -1178,6 +1223,10 @@ func (p *playbackEngine) stopPollTimePos() {
 
 func (p *playbackEngine) handleTimePosUpdate(seeked bool) {
 	s := p.PlaybackStatus()
+	if !p.firstPlaybackPositionLogged && s.TimePos > 0 {
+		p.firstPlaybackPositionLogged = true
+		audioDebugf("first nonzero playback position idx=%d pos=%.3f total=%.3f", p.nowPlayingIdx, s.TimePos, s.Duration)
+	}
 	var meta mediaprovider.MediaItemMetadata
 	if np := p.NowPlaying(); np != nil {
 		meta = np.Metadata()

@@ -2,6 +2,7 @@ package dialogs
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -12,7 +13,7 @@ import (
 	"unicode"
 
 	"github.com/dweymouth/supersonic/backend"
-	"github.com/dweymouth/supersonic/backend/player/mpv"
+	"github.com/dweymouth/supersonic/backend/player"
 	"github.com/dweymouth/supersonic/res"
 	myTheme "github.com/dweymouth/supersonic/ui/theme"
 	"github.com/dweymouth/supersonic/ui/util"
@@ -29,21 +30,44 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+func audioDeviceDisplayName(dev player.AudioDevice) string {
+	if dev.Name == "auto" {
+		return dev.Description
+	}
+	status := "Shared"
+	if dev.Lossy {
+		status = "Lossy"
+	} else if dev.ExclusiveReady {
+		status = "Exclusive Ready"
+	}
+	transport := dev.Transport
+	if transport == "" {
+		transport = "Unknown"
+	}
+	if dev.MaxSampleRate > 0 && dev.MaxBitDepth > 0 {
+		return fmt.Sprintf("%s (%s, %s, %d-bit / %.1f kHz)",
+			dev.Description, transport, status, dev.MaxBitDepth, float64(dev.MaxSampleRate)/1000)
+	}
+	return fmt.Sprintf("%s (%s, %s)", dev.Description, transport, status)
+}
+
 type SettingsDialog struct {
 	widget.BaseWidget
 
-	OnReplayGainSettingsChanged    func()
-	OnAudioExclusiveSettingChanged func()
-	OnPauseFadeSettingsChanged     func()
-	OnAudioDeviceSettingChanged    func()
-	OnThemeSettingChanged          func()
-	OnDismiss                      func()
-	OnEqualizerSettingsChanged     func()
-	OnPageNeedsRefresh             func()
-	OnClearCaches                  func()
+	OnReplayGainSettingsChanged          func()
+	OnAudioExclusiveSettingChanged       func() error
+	OnAudioBitPerfectSettingChanged      func() error
+	OnPauseFadeSettingsChanged           func()
+	OnOutputStabilizationSettingsChanged func()
+	OnAudioDeviceSettingChanged          func()
+	OnThemeSettingChanged                func()
+	OnDismiss                            func()
+	OnEqualizerSettingsChanged           func()
+	OnPageNeedsRefresh                   func()
+	OnClearCaches                        func()
 
 	config          *backend.Config
-	audioDevices    []mpv.AudioDevice
+	audioDevices    []player.AudioDevice
 	themeFiles      map[string]string // filename -> displayName
 	promptText      *widget.RichText
 	eqPresetManager *backend.EQPresetManager
@@ -62,10 +86,9 @@ type ToastProvider interface {
 	ShowErrorToast(message string)
 }
 
-// TODO: having this depend on the mpv package for the AudioDevice type is kinda gross. Refactor.
 func NewSettingsDialog(
 	config *backend.Config,
-	audioDeviceList []mpv.AudioDevice,
+	audioDeviceList []player.AudioDevice,
 	themeFileList map[string]string,
 	equalizerBands []string,
 	clientDecidesScrobble bool,
@@ -358,7 +381,7 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 	deviceList := make([]string, len(s.audioDevices))
 	var selIndex int
 	for i, dev := range s.audioDevices {
-		deviceList[i] = dev.Description
+		deviceList[i] = audioDeviceDisplayName(dev)
 		if dev.Name == s.config.LocalPlayback.AudioDeviceName {
 			selIndex = i
 		}
@@ -372,6 +395,12 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 			s.OnAudioDeviceSettingChanged()
 		}
 	}
+	deviceDiagnostic := widget.NewButton(lang.L("DAC diagnostic"), func() {
+		idx := deviceSelect.SelectedIndex()
+		if idx >= 0 && idx < len(s.audioDevices) {
+			s.showAudioDeviceDiagnostic(s.audioDevices[idx])
+		}
+	})
 
 	rGainOpts := []string{lang.L("None"), lang.L("Album"), lang.L("Track"), lang.L("Auto")}
 	replayGainSelect := widget.NewSelect(rGainOpts, nil)
@@ -427,11 +456,98 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 	})
 	preventClipping.Checked = s.config.ReplayGain.PreventClipping
 
-	audioExclusive := widget.NewCheck(lang.L("Exclusive mode"), func(checked bool) {
+	var audioExclusive *widget.Check
+	var audioBitPerfect *widget.Check
+	audioExclusive = widget.NewCheck(lang.L("Exclusive/Hog mode"), func(checked bool) {
+		previous := s.config.LocalPlayback.AudioExclusive
+		previousBitPerfect := s.config.LocalPlayback.AudioBitPerfect
 		s.config.LocalPlayback.AudioExclusive = checked
-		s.onAudioExclusiveSettingsChanged()
+		if !checked {
+			s.config.LocalPlayback.AudioBitPerfect = false
+			audioBitPerfect.Checked = false
+			audioBitPerfect.Refresh()
+		}
+		if err := s.onAudioExclusiveSettingsChanged(); err != nil {
+			s.config.LocalPlayback.AudioExclusive = previous
+			s.config.LocalPlayback.AudioBitPerfect = previousBitPerfect
+			audioExclusive.Checked = previous
+			audioExclusive.Refresh()
+			audioBitPerfect.Checked = previousBitPerfect
+			audioBitPerfect.Refresh()
+			_ = s.onAudioExclusiveSettingsChanged()
+			_ = s.onAudioBitPerfectSettingsChanged()
+			if s.toastProvider != nil {
+				s.toastProvider.ShowErrorToast(lang.L("Exclusive unavailable") + ": " + err.Error())
+			}
+		}
 	})
 	audioExclusive.Checked = s.config.LocalPlayback.AudioExclusive
+	audioExclusiveHelp := widget.NewLabel(lang.L("Exclusive/Hog mode gives Supersonic sole access to the device. Use Supersonic's volume slider while Bit Perfect is off."))
+	audioExclusiveHelp.Wrapping = fyne.TextWrapWord
+
+	audioBitPerfect = widget.NewCheck(lang.L("Bit Perfect"), func(checked bool) {
+		previousExclusive := s.config.LocalPlayback.AudioExclusive
+		previousBitPerfect := s.config.LocalPlayback.AudioBitPerfect
+		s.config.LocalPlayback.AudioBitPerfect = checked
+		if checked {
+			s.config.LocalPlayback.AudioExclusive = true
+			audioExclusive.Checked = true
+			audioExclusive.Refresh()
+		}
+		if err := s.onAudioBitPerfectSettingsChanged(); err != nil {
+			s.config.LocalPlayback.AudioExclusive = previousExclusive
+			s.config.LocalPlayback.AudioBitPerfect = previousBitPerfect
+			audioExclusive.Checked = previousExclusive
+			audioExclusive.Refresh()
+			audioBitPerfect.Checked = previousBitPerfect
+			audioBitPerfect.Refresh()
+			_ = s.onAudioExclusiveSettingsChanged()
+			_ = s.onAudioBitPerfectSettingsChanged()
+			if s.toastProvider != nil {
+				s.toastProvider.ShowErrorToast(lang.L("Bit Perfect unavailable") + ": " + err.Error())
+			}
+		}
+	})
+	audioBitPerfect.Checked = s.config.LocalPlayback.AudioBitPerfect
+	audioBitPerfectHelp := widget.NewLabel(lang.L("Bit Perfect keeps samples unchanged and locks software volume at 100%. Use hardware/DAC volume or turn Bit Perfect off to change volume."))
+	audioBitPerfectHelp.Wrapping = fyne.TextWrapWord
+
+	digitsOnly := func(_, _ string, r rune) bool {
+		return unicode.IsDigit(r)
+	}
+	dacWarmUpDuration := widgets.NewTextRestrictedEntry(digitsOnly)
+	dacWarmUpDuration.SetMinCharWidth(2)
+	dacWarmUpDuration.Text = strconv.Itoa(clampSettingsInt(s.config.LocalPlayback.DACWarmUpDurationSeconds, 1, 10))
+	dacWarmUpDuration.OnChanged = func(text string) {
+		if v, err := strconv.Atoi(text); err == nil {
+			s.config.LocalPlayback.DACWarmUpDurationSeconds = clampSettingsInt(v, 1, 10)
+			s.onOutputStabilizationSettingsChanged()
+		}
+	}
+	dacWarmUp := widget.NewCheck(lang.L("DAC warm-up"), func(checked bool) {
+		s.config.LocalPlayback.DACWarmUpEnabled = checked
+		s.onOutputStabilizationSettingsChanged()
+	})
+	dacWarmUp.Checked = s.config.LocalPlayback.DACWarmUpEnabled
+	dacWarmUpHelp := widget.NewLabel(lang.L("Stream silence before the first exclusive track so the DAC can lock before audible playback."))
+	dacWarmUpHelp.Wrapping = fyne.TextWrapWord
+
+	sampleRatePauseDuration := widgets.NewTextRestrictedEntry(digitsOnly)
+	sampleRatePauseDuration.SetMinCharWidth(4)
+	sampleRatePauseDuration.Text = strconv.Itoa(clampSettingsInt(s.config.LocalPlayback.SampleRateSwitchPauseMilliseconds, 0, 1000))
+	sampleRatePauseDuration.OnChanged = func(text string) {
+		if v, err := strconv.Atoi(text); err == nil {
+			s.config.LocalPlayback.SampleRateSwitchPauseMilliseconds = clampSettingsInt(v, 0, 1000)
+			s.onOutputStabilizationSettingsChanged()
+		}
+	}
+	sampleRatePause := widget.NewCheck(lang.L("Sample-rate switch pause"), func(checked bool) {
+		s.config.LocalPlayback.SampleRateSwitchPauseEnabled = checked
+		s.onOutputStabilizationSettingsChanged()
+	})
+	sampleRatePause.Checked = s.config.LocalPlayback.SampleRateSwitchPauseEnabled
+	sampleRatePauseHelp := widget.NewLabel(lang.L("After exclusive output changes rate, hold silence briefly so the DAC can relock."))
+	sampleRatePauseHelp.Wrapping = fyne.TextWrapWord
 
 	pauseFade := widget.NewCheck(lang.L("Fade out on pause"), func(checked bool) {
 		s.config.LocalPlayback.PauseFade = checked
@@ -444,6 +560,11 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 	if !isLocalPlayer {
 		deviceSelect.Disable()
 		audioExclusive.Disable()
+		audioBitPerfect.Disable()
+		dacWarmUp.Disable()
+		dacWarmUpDuration.Disable()
+		sampleRatePause.Disable()
+		sampleRatePauseDuration.Disable()
 		pauseFade.Disable()
 	}
 	if !isReplayGainPlayer {
@@ -456,8 +577,16 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 
 		container.New(&layout.CustomPaddedLayout{TopPadding: 5},
 			container.New(layout.NewFormLayout(),
-				widget.NewLabel(lang.L("Audio device")), container.NewBorder(nil, nil, nil, util.NewHSpace(70), deviceSelect),
-				layout.NewSpacer(), audioExclusive,
+				widget.NewLabel(lang.L("Audio device")), container.NewBorder(nil, nil, nil, nil,
+					container.NewHBox(deviceSelect, deviceDiagnostic)),
+				layout.NewSpacer(), container.NewVBox(audioExclusive, audioExclusiveHelp),
+				layout.NewSpacer(), container.NewVBox(audioBitPerfect, audioBitPerfectHelp),
+				layout.NewSpacer(), container.NewVBox(dacWarmUp, dacWarmUpHelp,
+					container.NewHBox(widget.NewLabel(lang.L("Duration")), dacWarmUpDuration, widget.NewLabel(lang.L("s"))),
+				),
+				layout.NewSpacer(), container.NewVBox(sampleRatePause, sampleRatePauseHelp,
+					container.NewHBox(widget.NewLabel(lang.L("Duration")), sampleRatePauseDuration, widget.NewLabel(lang.L("ms"))),
+				),
 			)),
 		pauseFade,
 		s.newSectionSeparator(),
@@ -478,6 +607,34 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 			widget.NewEntryWithData(binding.BindString(&s.config.Playback.SkipKeywordWhenShuffling)),
 		),
 	))
+}
+
+func (s *SettingsDialog) showAudioDeviceDiagnostic(dev player.AudioDevice) {
+	status := lang.L("Shared Output")
+	if dev.Lossy {
+		status = lang.L("Lossy")
+	} else if dev.ExclusiveReady {
+		status = lang.L("Exclusive Ready")
+	}
+	row := func(label, value string) fyne.CanvasObject {
+		if value == "" {
+			value = "-"
+		}
+		return container.NewGridWithColumns(2, widget.NewLabel(label), widget.NewLabel(value))
+	}
+	content := container.NewVBox(
+		widget.NewLabelWithStyle(dev.Description, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewSeparator(),
+		row(lang.L("Status"), status),
+		row(lang.L("Transport"), dev.Transport),
+		row(lang.L("Active format"), dev.ActiveFormat),
+		row(lang.L("Maximum capability"), fmt.Sprintf("%d-bit / %.1f kHz", dev.MaxBitDepth, float64(dev.MaxSampleRate)/1000)),
+		row(lang.L("Sample rate range"), fmt.Sprintf("%.1f kHz - %.1f kHz", float64(dev.MinSampleRate)/1000, float64(dev.MaxSampleRate)/1000)),
+		row(lang.L("Channels"), fmt.Sprintf("%dch", dev.Channels)),
+		row(lang.L("Physical formats"), fmt.Sprintf("%d total, %d exclusive", dev.PhysicalFormatCount, dev.ExclusiveFormatCount)),
+		row(lang.L("Routing"), fmt.Sprintf("%dch -> device output", dev.Channels)),
+	)
+	dialog.ShowCustom(lang.L("DAC diagnostic"), lang.L("Close"), content, s.window)
 }
 
 func (s *SettingsDialog) createEqualizerTab(eqBands []string) *container.TabItem {
@@ -890,10 +1047,34 @@ func (s *SettingsDialog) onReplayGainSettingsChanged() {
 	}
 }
 
-func (s *SettingsDialog) onAudioExclusiveSettingsChanged() {
+func (s *SettingsDialog) onAudioExclusiveSettingsChanged() error {
 	if s.OnAudioExclusiveSettingChanged != nil {
-		s.OnAudioExclusiveSettingChanged()
+		return s.OnAudioExclusiveSettingChanged()
 	}
+	return nil
+}
+
+func (s *SettingsDialog) onAudioBitPerfectSettingsChanged() error {
+	if s.OnAudioBitPerfectSettingChanged != nil {
+		return s.OnAudioBitPerfectSettingChanged()
+	}
+	return nil
+}
+
+func (s *SettingsDialog) onOutputStabilizationSettingsChanged() {
+	if s.OnOutputStabilizationSettingsChanged != nil {
+		s.OnOutputStabilizationSettingsChanged()
+	}
+}
+
+func clampSettingsInt(v, minValue, maxValue int) int {
+	if v < minValue {
+		return minValue
+	}
+	if v > maxValue {
+		return maxValue
+	}
+	return v
 }
 
 func (s *SettingsDialog) CreateRenderer() fyne.WidgetRenderer {

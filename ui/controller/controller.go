@@ -16,7 +16,6 @@ import (
 	"github.com/dweymouth/supersonic/backend"
 	"github.com/dweymouth/supersonic/backend/mediaprovider"
 	"github.com/dweymouth/supersonic/backend/player"
-	"github.com/dweymouth/supersonic/backend/player/mpv"
 	"github.com/dweymouth/supersonic/sharedutil"
 	"github.com/dweymouth/supersonic/ui/dialogs"
 	myTheme "github.com/dweymouth/supersonic/ui/theme"
@@ -226,7 +225,10 @@ func (m *Controller) ShowPopUpPlayQueue() {
 			for range t.C {
 				fyne.Do(func() {
 					now := time.Now().UnixMilli()
-					if m.popUpQueueLastUsed < now-120_000 /*2 min*/ {
+					if m.popUpQueue != nil && m.popUpQueueLastUsed < now-120_000 /*2 min*/ {
+						if m.popUpQueue.Visible() {
+							m.popUpQueue.Hide()
+						}
 						fynetooltip.DestroyPopUpToolTipLayer(m.popUpQueue)
 						m.popUpQueue = nil
 						m.popUpQueueList = nil
@@ -312,12 +314,12 @@ func (c *Controller) ShowSettingsDialog(themeUpdateCallbk func(), themeFiles map
 	devs, err := c.App.LocalPlayer.ListAudioDevices()
 	if err != nil {
 		log.Printf("error listing audio devices: %v", err)
-		devs = []mpv.AudioDevice{{Name: "auto", Description: lang.L("Autoselect device")}}
+		devs = []player.AudioDevice{{Name: "auto", Description: lang.L("Autoselect device")}}
 	}
 
 	curPlayer := c.App.PlaybackManager.CurrentPlayer()
 	_, isReplayGainPlayer := curPlayer.(player.ReplayGainPlayer)
-	_, isEqualizerPlayer := curPlayer.(*mpv.Player)
+	_, isEqualizerPlayer := curPlayer.(player.LocalPlayer)
 	_, canSavePlayQueue := c.App.ServerManager.Server.(mediaprovider.CanSavePlayQueue)
 	isLocalPlayer := isEqualizerPlayer
 	bands := c.App.LocalPlayer.Equalizer().BandFrequencies()
@@ -334,11 +336,17 @@ func (c *Controller) ShowSettingsDialog(themeUpdateCallbk func(), themeFiles map
 	dlg.OnReplayGainSettingsChanged = func() {
 		c.App.PlaybackManager.SetReplayGainOptions(c.App.Config.ReplayGain)
 	}
-	dlg.OnAudioExclusiveSettingChanged = func() {
-		c.App.LocalPlayer.SetAudioExclusive(c.App.Config.LocalPlayback.AudioExclusive)
+	dlg.OnAudioExclusiveSettingChanged = func() error {
+		return c.App.LocalPlayer.SetAudioExclusive(c.App.Config.LocalPlayback.AudioExclusive)
+	}
+	dlg.OnAudioBitPerfectSettingChanged = func() error {
+		return c.App.LocalPlayer.SetAudioBitPerfect(c.App.Config.LocalPlayback.AudioBitPerfect)
 	}
 	dlg.OnPauseFadeSettingsChanged = func() {
 		c.App.LocalPlayer.SetPauseFade(c.App.Config.LocalPlayback.PauseFade)
+	}
+	dlg.OnOutputStabilizationSettingsChanged = func() {
+		c.App.LocalPlayer.SetOutputStabilizationOptions(backend.LocalPlaybackStabilizationOptions(c.App.Config.LocalPlayback))
 	}
 	dlg.OnAudioDeviceSettingChanged = func() {
 		c.App.LocalPlayer.SetAudioDevice(c.App.Config.LocalPlayback.AudioDeviceName)
@@ -346,9 +354,9 @@ func (c *Controller) ShowSettingsDialog(themeUpdateCallbk func(), themeFiles map
 	dlg.OnThemeSettingChanged = themeUpdateCallbk
 	dlg.OnEqualizerSettingsChanged = func() {
 		// Create the appropriate equalizer type based on config
-		var eq mpv.Equalizer
+		var eq player.Equalizer
 		if c.App.Config.LocalPlayback.EqualizerType == "ISO10Band" {
-			eq10 := &mpv.ISO10BandEqualizer{
+			eq10 := &player.ISO10BandEqualizer{
 				Disabled: !c.App.Config.LocalPlayback.EqualizerEnabled,
 				EQPreamp: c.App.Config.LocalPlayback.EqualizerPreamp,
 			}
@@ -359,7 +367,7 @@ func (c *Controller) ShowSettingsDialog(themeUpdateCallbk func(), themeFiles map
 			}
 			eq = eq10
 		} else {
-			eq15 := &mpv.ISO15BandEqualizer{
+			eq15 := &player.ISO15BandEqualizer{
 				Disabled: !c.App.Config.LocalPlayback.EqualizerEnabled,
 				EQPreamp: c.App.Config.LocalPlayback.EqualizerPreamp,
 			}
