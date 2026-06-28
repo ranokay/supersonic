@@ -144,6 +144,7 @@ func main() {
 		mainWindow.ShowAndRun()
 	}
 
+	mainWindow.BottomPanel.Stop()
 	log.Println("Running shutdown tasks...")
 	myApp.Shutdown()
 }

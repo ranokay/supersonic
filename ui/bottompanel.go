@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dweymouth/supersonic/backend"
@@ -30,6 +31,10 @@ type BottomPanel struct {
 	container *fyne.Container
 
 	cfg *backend.Config
+
+	qualityRefreshStop     chan struct{}
+	qualityRefreshStopped  chan struct{}
+	qualityRefreshStopOnce sync.Once
 }
 
 var _ fyne.Widget = (*BottomPanel)(nil)
@@ -188,17 +193,39 @@ func (bp *BottomPanel) updateSoftwareVolumeLock(pm *backend.PlaybackManager) {
 }
 
 func (bp *BottomPanel) startQualityRefreshLoop(pm *backend.PlaybackManager) {
+	if bp.qualityRefreshStop != nil {
+		return
+	}
+	bp.qualityRefreshStop = make(chan struct{})
+	bp.qualityRefreshStopped = make(chan struct{})
 	tick := time.NewTicker(time.Second)
 	go func() {
-		for range tick.C {
-			if pm.PlaybackStatus().State == player.Stopped {
-				continue
+		defer tick.Stop()
+		defer close(bp.qualityRefreshStopped)
+		for {
+			select {
+			case <-bp.qualityRefreshStop:
+				return
+			case <-tick.C:
+				if pm.PlaybackStatus().State == player.Stopped {
+					continue
+				}
+				fyne.Do(func() {
+					bp.updateSoftwareVolumeLock(pm)
+				})
 			}
-			fyne.Do(func() {
-				bp.updateSoftwareVolumeLock(pm)
-			})
 		}
 	}()
+}
+
+func (bp *BottomPanel) Stop() {
+	if bp.qualityRefreshStop == nil {
+		return
+	}
+	bp.qualityRefreshStopOnce.Do(func() {
+		close(bp.qualityRefreshStop)
+		<-bp.qualityRefreshStopped
+	})
 }
 
 func qualityPathInfo(info player.MediaInfo) widgets.QualityPathInfo {
