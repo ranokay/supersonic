@@ -34,6 +34,7 @@ type AuxControls struct {
 
 	qualityInfo QualityPathInfo
 	qualityPop  *widget.PopUp
+	qualityBody *fyne.Container
 	container   *fyne.Container
 }
 
@@ -105,21 +106,25 @@ func NewAuxControls(initialVolume int, initialAutoplay bool) *AuxControls {
 }
 
 func (a *AuxControls) SetQualityPath(info QualityPathInfo) {
+	info = normalizeQualityPathInfo(info)
+	if a.qualityInfo == info {
+		return
+	}
+	a.qualityInfo = info
+	a.quality.SetText(info.Badge)
+	a.quality.SetToolTip(a.qualityToolTip(info))
+	a.updateQualityPopContent()
+	a.Refresh()
+}
+
+func normalizeQualityPathInfo(info QualityPathInfo) QualityPathInfo {
 	if info.Badge == "" {
 		info.Badge = "Audio"
 	}
 	if info.Status == "" {
 		info.Status = "Shared Output"
 	}
-	a.qualityInfo = info
-	a.quality.SetText(info.Badge)
-	a.quality.SetToolTip(a.qualityToolTip(info))
-	if a.qualityPop != nil {
-		fynetooltip.DestroyPopUpToolTipLayer(a.qualityPop)
-		a.qualityPop.Hide()
-		a.qualityPop = nil
-	}
-	a.Refresh()
+	return info
 }
 
 func (a *AuxControls) qualityToolTip(info QualityPathInfo) string {
@@ -134,10 +139,43 @@ func (a *AuxControls) qualityToolTip(info QualityPathInfo) string {
 }
 
 func (a *AuxControls) showQualityPath() {
+	if a.qualityPop != nil && a.qualityPop.Visible() {
+		a.qualityPop.Hide()
+		fynetooltip.DestroyPopUpToolTipLayer(a.qualityPop)
+		a.qualityPop = nil
+		a.qualityBody = nil
+		return
+	}
 	canvas := fyne.CurrentApp().Driver().CanvasForObject(a.quality)
 	if canvas == nil {
 		return
 	}
+	content := a.buildQualityPathContent()
+	a.qualityBody = content
+	a.qualityPop = widget.NewPopUp(content, canvas)
+	fynetooltip.AddPopUpToolTipLayer(a.qualityPop)
+	pos := fyne.NewPos(0, -content.MinSize().Height-theme.Padding())
+	a.qualityPop.ShowAtRelativePosition(pos, a.quality)
+}
+
+func (a *AuxControls) updateQualityPopContent() {
+	if a.qualityPop == nil || a.qualityBody == nil {
+		return
+	}
+	if !a.qualityPop.Visible() {
+		a.qualityPop = nil
+		a.qualityBody = nil
+		return
+	}
+	content := a.buildQualityPathContent()
+	a.qualityBody.Objects = content.Objects
+	a.qualityBody.Refresh()
+	pos := fyne.NewPos(0, -a.qualityBody.MinSize().Height-theme.Padding())
+	a.qualityPop.Resize(a.qualityBody.MinSize())
+	a.qualityPop.ShowAtRelativePosition(pos, a.quality)
+}
+
+func (a *AuxControls) buildQualityPathContent() *fyne.Container {
 	info := a.qualityInfo
 	title := widget.NewLabelWithStyle(info.Status, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	rows := []fyne.CanvasObject{title, widget.NewSeparator()}
@@ -169,11 +207,7 @@ func (a *AuxControls) showQualityPath() {
 	if info.Reason != "" && !info.BitPerfectActive {
 		addRow("Reason", info.Reason)
 	}
-	content := container.NewPadded(container.NewVBox(rows...))
-	a.qualityPop = widget.NewPopUp(content, canvas)
-	fynetooltip.AddPopUpToolTipLayer(a.qualityPop)
-	pos := fyne.NewPos(0, -content.MinSize().Height-theme.Padding())
-	a.qualityPop.ShowAtRelativePosition(pos, a.quality)
+	return container.NewPadded(container.NewVBox(rows...))
 }
 
 func (a *AuxControls) CreateRenderer() fyne.WidgetRenderer {

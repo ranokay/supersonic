@@ -46,6 +46,7 @@ type PlaybackManager struct {
 
 	lastPlayTime         float64
 	lastPlayingID        string
+	pendingWaveformItem  mediaprovider.MediaItem
 	wfmUpdateImageCancel context.CancelFunc
 	wfmImageJobs         [3]*WaveformImageJob
 
@@ -153,7 +154,7 @@ func (p *PlaybackManager) addOnTrackChangeHook() {
 			// we already called handleWaveformImageSongChange in the onBeforeSongChange hook above
 			p.wasLoadTrackPaused = false
 		} else {
-			p.handleWaveformImageSongChange(item)
+			p.pendingWaveformItem = item
 		}
 
 		if runtime.GOOS != "windows" {
@@ -170,6 +171,15 @@ func (p *PlaybackManager) addOnTrackChangeHook() {
 				}
 			}()
 		}
+	})
+	p.OnPlaying(func() {
+		if p.pendingWaveformItem != nil {
+			p.handleWaveformImageSongChange(p.pendingWaveformItem)
+			p.pendingWaveformItem = nil
+		}
+	})
+	p.OnStopped(func() {
+		p.pendingWaveformItem = nil
 	})
 	p.OnRadioMetadataChange(func(radioName, title, artist string) {
 		p.radioStationName = radioName

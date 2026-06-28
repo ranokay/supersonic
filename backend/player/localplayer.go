@@ -90,6 +90,13 @@ type MediaInfo struct {
 	DoPCarrierRate int
 }
 
+type OutputStabilizationOptions struct {
+	DACWarmUpEnabled                  bool
+	DACWarmUpDurationSeconds          int
+	SampleRateSwitchPauseEnabled      bool
+	SampleRateSwitchPauseMilliseconds int
+}
+
 // LocalPlayer is implemented by any local audio playback engine
 // (currently mpv and localav).  All methods used by the UI and backend
 // that go beyond the core BasePlayer / URLPlayer interfaces are listed here.
@@ -103,6 +110,7 @@ type LocalPlayer interface {
 	SetAudioExclusive(bool) error
 	SetAudioBitPerfect(bool) error
 	SetPauseFade(bool)
+	SetOutputStabilizationOptions(OutputStabilizationOptions)
 
 	ListAudioDevices() ([]AudioDevice, error)
 	SetAudioDevice(string) error

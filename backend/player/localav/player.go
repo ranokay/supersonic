@@ -31,14 +31,17 @@ var _ player.LocalPlayer = (*Player)(nil)
 type Player struct {
 	player.BasePlayerCallbackImpl
 
-	ctx   *C.av_player_t
-	mu    sync.Mutex // guards filter state, nextURL fields
-	initd bool
+	ctx     *C.av_player_t
+	mu      sync.Mutex // guards filter state, nextURL fields
+	stateMu sync.Mutex // guards status and icyTitleCb
+	fadeMu  sync.Mutex
+	initd   bool
 
 	vol             int
 	audioExclusive  bool
 	audioBitPerfect bool
 	pauseFade       bool
+	stabilization   player.OutputStabilizationOptions
 
 	equalizer      player.Equalizer
 	replayGainOpts player.ReplayGainOptions
@@ -53,6 +56,8 @@ type Player struct {
 	// decode loop control
 	stopDecode    chan struct{} // closed to signal the loop to exit
 	decodeStopped chan struct{} // closed when the loop has exited
+	fadeCancel    chan struct{}
+	fadeDone      chan struct{}
 }
 
 // New creates a new Player.  Call Init before use.
@@ -60,6 +65,33 @@ func New() *Player {
 	return &Player{
 		vol: 100,
 	}
+}
+
+func (p *Player) statusState() player.State {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.status.State
+}
+
+func (p *Player) setStatusState(state player.State) {
+	p.stateMu.Lock()
+	p.status.State = state
+	p.stateMu.Unlock()
+}
+
+func (p *Player) setStoppedStatus(resetPosition bool) {
+	p.stateMu.Lock()
+	p.status.State = player.Stopped
+	if resetPosition {
+		p.status.TimePos = 0
+		p.status.Duration = 0
+	}
+	p.stateMu.Unlock()
+}
+
+func (p *Player) isActive() bool {
+	state := p.statusState()
+	return state == player.Playing || state == player.Paused
 }
 
 // Init allocates the C player and opens the default audio device.
@@ -75,6 +107,7 @@ func (p *Player) Init() error {
 	}
 	p.initd = true
 	p.setVolumeCGo(p.vol)
+	p.setOutputStabilizationCGo(p.stabilization)
 	return nil
 }
 
@@ -96,7 +129,7 @@ func (p *Player) PlayFile(url string, _ mediaprovider.MediaItemMetadata, startTi
 
 	p.updateEQ()
 	p.updateReplayGain()
-	p.status.State = player.Playing
+	p.setStatusState(player.Playing)
 	p.startDecodeLoop()
 	p.InvokeOnTrackChange()
 	p.InvokeOnPlaying()
@@ -124,25 +157,33 @@ func (p *Player) SetNextFile(url string, _ mediaprovider.MediaItemMetadata) erro
 // ---- BasePlayer ------------------------------------------------------
 
 func (p *Player) Continue() error {
-	if p.status.State != player.Paused {
+	if !p.initd {
+		return ErrUnitialized
+	}
+	p.cancelFadeAndWait()
+	if p.statusState() != player.Paused {
 		return nil
 	}
 	C.av_player_resume(p.ctx)
-	p.status.State = player.Playing
+	p.setStatusState(player.Playing)
 	p.InvokeOnPlaying()
 	return nil
 }
 
 func (p *Player) Pause() error {
-	if p.status.State != player.Playing {
+	if !p.initd {
+		return ErrUnitialized
+	}
+	if p.statusState() != player.Playing {
 		return nil
 	}
 	if p.pauseFade {
-		go p.fadeAndPause()
+		p.startFadeAndPause()
 		return nil
 	}
+	p.cancelFadeAndWait()
 	C.av_player_pause(p.ctx)
-	p.status.State = player.Paused
+	p.setStatusState(player.Paused)
 	p.InvokeOnPaused()
 	return nil
 }
@@ -151,11 +192,10 @@ func (p *Player) Stop(_ bool) error {
 	if !p.initd {
 		return ErrUnitialized
 	}
+	p.cancelFadeAndWait()
 	p.stopDecodeLoop()
 	C.av_player_stop(p.ctx)
-	p.status.State = player.Stopped
-	p.status.TimePos = 0
-	p.status.Duration = 0
+	p.setStoppedStatus(true)
 	p.InvokeOnStopped()
 	return nil
 }
@@ -165,7 +205,7 @@ func (p *Player) SeekSeconds(secs float64) error {
 		return ErrUnitialized
 	}
 	// Stop the decode loop so it doesn't race with the filter graph rebuild inside seek.
-	wasPlaying := p.status.State == player.Playing || p.status.State == player.Paused
+	wasPlaying := p.isActive()
 	p.stopDecodeLoop()
 	C.av_player_seek(p.ctx, C.double(secs))
 	p.InvokeOnSeek()
@@ -197,6 +237,8 @@ func (p *Player) GetVolume() int {
 }
 
 func (p *Player) GetStatus() player.Status {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
 	if !p.initd {
 		return p.status
 	}
@@ -215,6 +257,7 @@ func (p *Player) GetStatus() player.Status {
 }
 
 func (p *Player) Destroy() {
+	p.cancelFadeAndWait()
 	p.stopDecodeLoop()
 	if p.ctx != nil {
 		C.av_player_destroy(p.ctx)
@@ -247,6 +290,13 @@ func (p *Player) SetPauseFade(enabled bool) {
 	p.pauseFade = enabled
 }
 
+func (p *Player) SetOutputStabilizationOptions(opts player.OutputStabilizationOptions) {
+	p.stabilization = opts
+	if p.initd {
+		p.setOutputStabilizationCGo(opts)
+	}
+}
+
 func (p *Player) SetAudioExclusive(exclusive bool) error {
 	bitPerfect := p.audioBitPerfect
 	if !exclusive {
@@ -269,7 +319,7 @@ func (p *Player) setAudioMode(exclusive, bitPerfect bool) error {
 		return nil
 	}
 
-	wasActive := p.status.State == player.Playing || p.status.State == player.Paused
+	wasActive := p.isActive()
 	if wasActive {
 		p.stopDecodeLoop()
 	}
@@ -298,7 +348,7 @@ func (p *Player) setAudioMode(exclusive, bitPerfect bool) error {
 	if wasActive && restoreRet == 0 {
 		p.startDecodeLoop()
 	} else if restoreRet != 0 {
-		p.status.State = player.Stopped
+		p.setStatusState(player.Stopped)
 		p.InvokeOnStopped()
 	}
 	return modeErr
@@ -320,6 +370,17 @@ func boolToCInt(v bool) C.int {
 	return 0
 }
 
+func (p *Player) setOutputStabilizationCGo(opts player.OutputStabilizationOptions) {
+	warmUpMs := opts.DACWarmUpDurationSeconds * 1000
+	C.av_player_set_output_stabilization(
+		p.ctx,
+		boolToCInt(opts.DACWarmUpEnabled),
+		C.int(warmUpMs),
+		boolToCInt(opts.SampleRateSwitchPauseEnabled),
+		C.int(opts.SampleRateSwitchPauseMilliseconds),
+	)
+}
+
 func (p *Player) audioModeError(ret int) error {
 	info, err := p.GetMediaInfo()
 	if err == nil && info.BitPerfectReason != "" {
@@ -332,6 +393,12 @@ func (p *Player) ListAudioDevices() ([]player.AudioDevice, error) {
 	const maxDevices = 64
 	cdevices := make([]C.av_device_info_t, maxDevices)
 	count := int(C.av_player_list_devices(&cdevices[0], C.int(maxDevices)))
+	if count < 0 {
+		return nil, errorf("av_player_list_devices failed: %d", count)
+	}
+	if count > maxDevices {
+		count = maxDevices
+	}
 	devices := make([]player.AudioDevice, count)
 	for i := range devices {
 		devices[i].Name = C.GoString(&cdevices[i].name[0])
@@ -356,7 +423,7 @@ func (p *Player) SetAudioDevice(deviceName string) error {
 	if !p.initd {
 		return ErrUnitialized
 	}
-	wasActive := p.status.State == player.Playing || p.status.State == player.Paused
+	wasActive := p.isActive()
 	if wasActive {
 		p.stopDecodeLoop()
 	}
@@ -368,7 +435,7 @@ func (p *Player) SetAudioDevice(deviceName string) error {
 	}
 	if ret != 0 {
 		if wasActive {
-			p.status.State = player.Stopped
+			p.setStatusState(player.Stopped)
 			p.InvokeOnStopped()
 		}
 		return errorf("SetAudioDevice failed: %d", int(ret))
@@ -436,7 +503,7 @@ func (p *Player) SetPeaksEnabled(enabled bool) error {
 // Returns -Inf for all channels when not playing or peaks not enabled.
 func (p *Player) GetPeaks() (float64, float64, float64, float64) {
 	nInf := math.Inf(-1)
-	if !p.initd || p.status.State != player.Playing {
+	if !p.initd || p.statusState() != player.Playing {
 		return nInf, nInf, nInf, nInf
 	}
 	var lp, rp, lr, rr C.double
@@ -447,11 +514,15 @@ func (p *Player) GetPeaks() (float64, float64, float64, float64) {
 // ObserveIcyRadioTitle registers a callback that is invoked whenever the ICY
 // StreamTitle changes on a playing internet radio stream.
 func (p *Player) ObserveIcyRadioTitle(cb func(string)) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
 	p.icyTitleCb = cb
 }
 
 // UnobserveIcyRadioTitle clears the ICY title callback.
 func (p *Player) UnobserveIcyRadioTitle() {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
 	p.icyTitleCb = nil
 }
 
@@ -459,6 +530,12 @@ func (p *Player) UnobserveIcyRadioTitle() {
 
 func (p *Player) setVolumeCGo(vol int) {
 	C.av_player_set_volume(p.ctx, C.float(float32(vol)/100.0))
+}
+
+func (p *Player) icyTitleCallback() func(string) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.icyTitleCb
 }
 
 func (p *Player) updateEQ() {
@@ -507,16 +584,70 @@ func (p *Player) updateReplayGain() {
 		C.double(p.replayGainOpts.PreampGain))
 }
 
-func (p *Player) fadeAndPause() {
+func (p *Player) startFadeAndPause() {
+	p.cancelFadeAndWait()
+	cancel := make(chan struct{})
+	done := make(chan struct{})
+	p.fadeMu.Lock()
+	p.fadeCancel = cancel
+	p.fadeDone = done
+	p.fadeMu.Unlock()
+	go p.fadeAndPause(cancel, done)
+}
+
+func (p *Player) cancelFadeAndWait() {
+	p.fadeMu.Lock()
+	cancel := p.fadeCancel
+	done := p.fadeDone
+	p.fadeCancel = nil
+	p.fadeDone = nil
+	if cancel != nil {
+		close(cancel)
+	}
+	p.fadeMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+func (p *Player) fadeAndPause(cancel <-chan struct{}, done chan struct{}) {
+	defer func() {
+		if p.initd && p.ctx != nil {
+			p.setVolumeCGo(p.vol)
+		}
+		p.fadeMu.Lock()
+		if p.fadeDone == done {
+			p.fadeCancel = nil
+			p.fadeDone = nil
+		}
+		p.fadeMu.Unlock()
+		close(done)
+	}()
+
 	vol := p.vol
 	for c := 0; c < 100; c++ {
+		select {
+		case <-cancel:
+			return
+		default:
+		}
 		newVol := float32(vol) * float32(100-c) / 100.0
 		C.av_player_set_volume(p.ctx, C.float(newVol/100.0))
-		time.Sleep(2 * time.Millisecond)
+		timer := time.NewTimer(2 * time.Millisecond)
+		select {
+		case <-cancel:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+	select {
+	case <-cancel:
+		return
+	default:
 	}
 	C.av_player_pause(p.ctx)
-	p.setVolumeCGo(p.vol)
-	p.status.State = player.Paused
+	p.setStatusState(player.Paused)
 	p.InvokeOnPaused()
 }
 
@@ -556,10 +687,11 @@ func (p *Player) decodeLoop(stop <-chan struct{}) {
 
 		result := int(C.av_player_decode_step(p.ctx))
 
-		if result == C.AVPLAYER_DECODE_OK && p.icyTitleCb != nil {
+		if result == C.AVPLAYER_DECODE_OK {
+			icyTitleCb := p.icyTitleCallback()
 			var icyBuf [512]C.char
-			if C.av_player_check_icy_title(p.ctx, &icyBuf[0], 512) != 0 {
-				p.icyTitleCb(C.GoString(&icyBuf[0]))
+			if icyTitleCb != nil && C.av_player_check_icy_title(p.ctx, &icyBuf[0], 512) != 0 {
+				icyTitleCb(C.GoString(&icyBuf[0]))
 			}
 		}
 
@@ -589,14 +721,14 @@ func (p *Player) decodeLoop(stop <-chan struct{}) {
 
 		case C.AVPLAYER_DECODE_STOPPED:
 			// Ring drained, no next track — truly stopped
-			if p.status.State != player.Stopped {
-				p.status.State = player.Stopped
+			if p.statusState() != player.Stopped {
+				p.setStatusState(player.Stopped)
 				p.InvokeOnStopped()
 			}
 			return
 
 		case C.AVPLAYER_DECODE_ERROR:
-			p.status.State = player.Stopped
+			p.setStatusState(player.Stopped)
 			p.InvokeOnStopped()
 			return
 		}

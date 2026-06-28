@@ -21,6 +21,30 @@
 #define ANALYZE_CHANNELS    1
 #define WAVEFORM_BINS       1024
 
+#if LIBAVCODEC_VERSION_MAJOR >= 59
+#define AV_WAVEFORM_HAVE_AV_CHANNEL_LAYOUT 1
+#else
+#define AV_WAVEFORM_HAVE_AV_CHANNEL_LAYOUT 0
+#endif
+
+static void waveform_normalize_channel_layout(AVCodecContext *ctx) {
+    if (!ctx) return;
+#if AV_WAVEFORM_HAVE_AV_CHANNEL_LAYOUT
+    if (!ctx->ch_layout.nb_channels)
+        av_channel_layout_default(&ctx->ch_layout, 2);
+    if (!ctx->ch_layout.u.mask) {
+        AVChannelLayout tmp;
+        av_channel_layout_default(&tmp, ctx->ch_layout.nb_channels);
+        av_channel_layout_copy(&ctx->ch_layout, &tmp);
+        av_channel_layout_uninit(&tmp);
+    }
+#else
+    if (ctx->channels <= 0) ctx->channels = 2;
+    if (!ctx->channel_layout)
+        ctx->channel_layout = av_get_default_channel_layout(ctx->channels);
+#endif
+}
+
 // Feed `got` resampled s16 mono samples into the chunk accumulators.
 // Finalizes chunks as they fill, writing to out_peak/out_rms and
 // advancing *cur_chunk with an atomic release store to *progress.
@@ -77,36 +101,42 @@ int av_analyze_waveform(const char *in_url, int64_t duration_ms,
     ret = avformat_find_stream_info(in_fmt, NULL);
     if (ret < 0) goto close_in;
 
+#if AV_WAVEFORM_HAVE_AV_CHANNEL_LAYOUT
     const AVCodec *codec = NULL;
+#else
+    AVCodec *codec = NULL;
+#endif
     int stream_idx = av_find_best_stream(in_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
     if (stream_idx < 0) { ret = stream_idx; goto close_in; }
 
     AVCodecContext *dec_ctx = avcodec_alloc_context3(codec);
     if (!dec_ctx) { ret = AVERROR(ENOMEM); goto close_in; }
 
-    avcodec_parameters_to_context(dec_ctx, in_fmt->streams[stream_idx]->codecpar);
+    ret = avcodec_parameters_to_context(dec_ctx, in_fmt->streams[stream_idx]->codecpar);
+    if (ret < 0) goto free_dec;
 
     // Normalise channel layout (mirrors decoder_open in av_player.c)
-    if (!dec_ctx->ch_layout.nb_channels)
-        av_channel_layout_default(&dec_ctx->ch_layout, 2);
-    if (!dec_ctx->ch_layout.u.mask) {
-        AVChannelLayout tmp = (dec_ctx->ch_layout.nb_channels == 1)
-            ? (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO
-            : (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
-        av_channel_layout_copy(&dec_ctx->ch_layout, &tmp);
-    }
+    waveform_normalize_channel_layout(dec_ctx);
 
     ret = avcodec_open2(dec_ctx, codec, NULL);
     if (ret < 0) goto free_dec;
 
     // ---- Resampler (to mono s16 at analysis rate) --------------------
-    AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_MONO;
     SwrContext *swr = NULL;
+#if AV_WAVEFORM_HAVE_AV_CHANNEL_LAYOUT
+    AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_MONO;
     ret = swr_alloc_set_opts2(&swr,
         &out_ch_layout,      AV_SAMPLE_FMT_S16, ANALYZE_SAMPLE_RATE,
         &dec_ctx->ch_layout, dec_ctx->sample_fmt, dec_ctx->sample_rate,
         0, NULL);
     if (ret < 0) goto free_dec;
+#else
+    swr = swr_alloc_set_opts(NULL,
+        AV_CH_LAYOUT_MONO,        AV_SAMPLE_FMT_S16, ANALYZE_SAMPLE_RATE,
+        dec_ctx->channel_layout,  dec_ctx->sample_fmt, dec_ctx->sample_rate,
+        0, NULL);
+    if (!swr) { ret = AVERROR(ENOMEM); goto free_dec; }
+#endif
     ret = swr_init(swr);
     if (ret < 0) goto free_swr;
 
@@ -117,13 +147,17 @@ int av_analyze_waveform(const char *in_url, int64_t duration_ms,
 
     AVPacket *pkt   = av_packet_alloc();
     AVFrame  *frame = av_frame_alloc();
+    if (!pkt || !frame) {
+        ret = AVERROR(ENOMEM);
+        goto done;
+    }
 
     int cur_chunk = 0;
     double chunk_peak = 0.0;
     double chunk_sum_sq = 0.0;
     int chunk_count = 0;
 
-    while (av_read_frame(in_fmt, pkt) >= 0) {
+    while ((ret = av_read_frame(in_fmt, pkt)) >= 0) {
         if (atomic_load_explicit(cancel, memory_order_acquire)) {
             av_packet_unref(pkt);
             ret = AVERROR_EXIT;
@@ -151,6 +185,10 @@ int av_analyze_waveform(const char *in_url, int64_t duration_ms,
                             out_peak, out_rms, progress);
             av_free(buf);
         }
+    }
+
+    if (ret != AVERROR_EOF) {
+        goto done;
     }
 
     // Flush decoder

@@ -367,6 +367,8 @@ func (a *App) callOnExit() error {
 
 func (a *App) setupLocalPlayer() error {
 	a.Config.LocalPlayback.Volume = clamp(a.Config.LocalPlayback.Volume, 0, 100)
+	a.Config.LocalPlayback.DACWarmUpDurationSeconds = clamp(a.Config.LocalPlayback.DACWarmUpDurationSeconds, 1, 10)
+	a.Config.LocalPlayback.SampleRateSwitchPauseMilliseconds = clamp(a.Config.LocalPlayback.SampleRateSwitchPauseMilliseconds, 0, 1000)
 	a.LocalPlayer.SetVolume(a.Config.LocalPlayback.Volume)
 
 	devs, err := a.LocalPlayer.ListAudioDevices()
@@ -420,6 +422,7 @@ func (a *App) setupLocalPlayer() error {
 		log.Printf("error applying bit-perfect setting: %v", err)
 	}
 	a.LocalPlayer.SetPauseFade(a.Config.LocalPlayback.PauseFade)
+	a.LocalPlayer.SetOutputStabilizationOptions(LocalPlaybackStabilizationOptions(a.Config.LocalPlayback))
 
 	// Initialize the appropriate equalizer type based on config
 	var eq player.Equalizer
@@ -449,6 +452,15 @@ func (a *App) setupLocalPlayer() error {
 	a.LocalPlayer.SetEqualizer(eq)
 
 	return nil
+}
+
+func LocalPlaybackStabilizationOptions(c LocalPlaybackConfig) player.OutputStabilizationOptions {
+	return player.OutputStabilizationOptions{
+		DACWarmUpEnabled:                  c.DACWarmUpEnabled,
+		DACWarmUpDurationSeconds:          clamp(c.DACWarmUpDurationSeconds, 1, 10),
+		SampleRateSwitchPauseEnabled:      c.SampleRateSwitchPauseEnabled,
+		SampleRateSwitchPauseMilliseconds: clamp(c.SampleRateSwitchPauseMilliseconds, 0, 1000),
+	}
 }
 
 func (a *App) setupMPRIS(mprisAppName string) {

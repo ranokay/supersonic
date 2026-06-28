@@ -199,6 +199,13 @@ int av_player_set_exclusive(av_player_t *p, int exclusive);
 // Set strict bit-perfect mode on/off. Returns 0 on success.
 int av_player_set_bitperfect(av_player_t *p, int bitperfect);
 
+// Configure output stabilization silence for exclusive/CoreAudio playback.
+void av_player_set_output_stabilization(av_player_t *p,
+                                        int dac_warmup_enabled,
+                                        int dac_warmup_ms,
+                                        int sample_rate_pause_enabled,
+                                        int sample_rate_pause_ms);
+
 // ---- Decode loop (called from Go goroutine) --------------------------
 
 // Perform one decode step: read → decode → filter → write ring buffer.

@@ -1,9 +1,11 @@
 package widgets
 
 import (
+	"strings"
 	"testing"
 
 	"fyne.io/fyne/v2/test"
+	fynetooltip "github.com/dweymouth/fyne-tooltip"
 )
 
 func TestVolumeControlSoftwareVolumeLock(t *testing.T) {
@@ -44,5 +46,46 @@ func TestVolumeControlSoftwareVolumeLock(t *testing.T) {
 	}
 	if got := int(c.slider.Value); got != 42 {
 		t.Fatalf("unlocked volume display = %d, want latent software volume 42", got)
+	}
+}
+
+func TestQualityPathPopupStaysOpenAcrossRefreshes(t *testing.T) {
+	test.NewTempApp(t)
+
+	a := NewAuxControls(100, false)
+	w := test.NewWindow(nil)
+	w.SetContent(fynetooltip.AddWindowToolTipLayer(a, w.Canvas()))
+	defer w.Close()
+	defer fynetooltip.DestroyWindowToolTipLayer(w.Canvas())
+
+	a.SetQualityPath(QualityPathInfo{
+		Badge:            "Bit-perfect 96.0 kHz / s32",
+		Status:           "Bit-Perfect",
+		SourceFormat:     "96.0 kHz / 24-bit / 2ch",
+		OutputPath:       "Integer PCM / 96.0 kHz / 2ch",
+		BitPerfectActive: true,
+	})
+	a.showQualityPath()
+	if a.qualityPop == nil || !a.qualityPop.Visible() {
+		t.Fatal("expected quality popup to be visible")
+	}
+	original := a.qualityPop
+
+	a.SetQualityPath(QualityPathInfo{
+		Badge:            "Bit-perfect 192.0 kHz / s32",
+		Status:           "Bit-Perfect",
+		SourceFormat:     "192.0 kHz / 24-bit / 2ch",
+		OutputPath:       "Integer PCM / 192.0 kHz / 2ch",
+		BitPerfectActive: true,
+	})
+
+	if a.qualityPop != original {
+		t.Fatal("expected quality popup to be updated in place")
+	}
+	if !a.qualityPop.Visible() {
+		t.Fatal("expected quality popup to remain visible after quality refresh")
+	}
+	if !strings.Contains(a.qualityToolTip(a.qualityInfo), "Bit-Perfect") {
+		t.Fatal("expected refreshed quality info to remain available")
 	}
 }

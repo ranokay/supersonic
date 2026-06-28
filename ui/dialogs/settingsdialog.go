@@ -54,16 +54,17 @@ func audioDeviceDisplayName(dev player.AudioDevice) string {
 type SettingsDialog struct {
 	widget.BaseWidget
 
-	OnReplayGainSettingsChanged     func()
-	OnAudioExclusiveSettingChanged  func() error
-	OnAudioBitPerfectSettingChanged func() error
-	OnPauseFadeSettingsChanged      func()
-	OnAudioDeviceSettingChanged     func()
-	OnThemeSettingChanged           func()
-	OnDismiss                       func()
-	OnEqualizerSettingsChanged      func()
-	OnPageNeedsRefresh              func()
-	OnClearCaches                   func()
+	OnReplayGainSettingsChanged          func()
+	OnAudioExclusiveSettingChanged       func() error
+	OnAudioBitPerfectSettingChanged      func() error
+	OnPauseFadeSettingsChanged           func()
+	OnOutputStabilizationSettingsChanged func()
+	OnAudioDeviceSettingChanged          func()
+	OnThemeSettingChanged                func()
+	OnDismiss                            func()
+	OnEqualizerSettingsChanged           func()
+	OnPageNeedsRefresh                   func()
+	OnClearCaches                        func()
 
 	config          *backend.Config
 	audioDevices    []player.AudioDevice
@@ -473,6 +474,8 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 			audioExclusive.Refresh()
 			audioBitPerfect.Checked = previousBitPerfect
 			audioBitPerfect.Refresh()
+			_ = s.onAudioExclusiveSettingsChanged()
+			_ = s.onAudioBitPerfectSettingsChanged()
 			if s.toastProvider != nil {
 				s.toastProvider.ShowErrorToast(lang.L("Exclusive unavailable") + ": " + err.Error())
 			}
@@ -498,6 +501,8 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 			audioExclusive.Refresh()
 			audioBitPerfect.Checked = previousBitPerfect
 			audioBitPerfect.Refresh()
+			_ = s.onAudioExclusiveSettingsChanged()
+			_ = s.onAudioBitPerfectSettingsChanged()
 			if s.toastProvider != nil {
 				s.toastProvider.ShowErrorToast(lang.L("Bit Perfect unavailable") + ": " + err.Error())
 			}
@@ -506,6 +511,43 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 	audioBitPerfect.Checked = s.config.LocalPlayback.AudioBitPerfect
 	audioBitPerfectHelp := widget.NewLabel(lang.L("Bit Perfect keeps samples unchanged and locks software volume at 100%. Use hardware/DAC volume or turn Bit Perfect off to change volume."))
 	audioBitPerfectHelp.Wrapping = fyne.TextWrapWord
+
+	digitsOnly := func(_, _ string, r rune) bool {
+		return unicode.IsDigit(r)
+	}
+	dacWarmUpDuration := widgets.NewTextRestrictedEntry(digitsOnly)
+	dacWarmUpDuration.SetMinCharWidth(2)
+	dacWarmUpDuration.Text = strconv.Itoa(clampSettingsInt(s.config.LocalPlayback.DACWarmUpDurationSeconds, 1, 10))
+	dacWarmUpDuration.OnChanged = func(text string) {
+		if v, err := strconv.Atoi(text); err == nil {
+			s.config.LocalPlayback.DACWarmUpDurationSeconds = clampSettingsInt(v, 1, 10)
+			s.onOutputStabilizationSettingsChanged()
+		}
+	}
+	dacWarmUp := widget.NewCheck(lang.L("DAC warm-up"), func(checked bool) {
+		s.config.LocalPlayback.DACWarmUpEnabled = checked
+		s.onOutputStabilizationSettingsChanged()
+	})
+	dacWarmUp.Checked = s.config.LocalPlayback.DACWarmUpEnabled
+	dacWarmUpHelp := widget.NewLabel(lang.L("Stream silence before the first exclusive track so the DAC can lock before audible playback."))
+	dacWarmUpHelp.Wrapping = fyne.TextWrapWord
+
+	sampleRatePauseDuration := widgets.NewTextRestrictedEntry(digitsOnly)
+	sampleRatePauseDuration.SetMinCharWidth(4)
+	sampleRatePauseDuration.Text = strconv.Itoa(clampSettingsInt(s.config.LocalPlayback.SampleRateSwitchPauseMilliseconds, 0, 1000))
+	sampleRatePauseDuration.OnChanged = func(text string) {
+		if v, err := strconv.Atoi(text); err == nil {
+			s.config.LocalPlayback.SampleRateSwitchPauseMilliseconds = clampSettingsInt(v, 0, 1000)
+			s.onOutputStabilizationSettingsChanged()
+		}
+	}
+	sampleRatePause := widget.NewCheck(lang.L("Sample-rate switch pause"), func(checked bool) {
+		s.config.LocalPlayback.SampleRateSwitchPauseEnabled = checked
+		s.onOutputStabilizationSettingsChanged()
+	})
+	sampleRatePause.Checked = s.config.LocalPlayback.SampleRateSwitchPauseEnabled
+	sampleRatePauseHelp := widget.NewLabel(lang.L("After exclusive output changes rate, hold silence briefly so the DAC can relock."))
+	sampleRatePauseHelp.Wrapping = fyne.TextWrapWord
 
 	pauseFade := widget.NewCheck(lang.L("Fade out on pause"), func(checked bool) {
 		s.config.LocalPlayback.PauseFade = checked
@@ -519,6 +561,10 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 		deviceSelect.Disable()
 		audioExclusive.Disable()
 		audioBitPerfect.Disable()
+		dacWarmUp.Disable()
+		dacWarmUpDuration.Disable()
+		sampleRatePause.Disable()
+		sampleRatePauseDuration.Disable()
 		pauseFade.Disable()
 	}
 	if !isReplayGainPlayer {
@@ -535,6 +581,12 @@ func (s *SettingsDialog) createPlaybackTab(isLocalPlayer, isReplayGainPlayer boo
 					container.NewHBox(deviceSelect, deviceDiagnostic)),
 				layout.NewSpacer(), container.NewVBox(audioExclusive, audioExclusiveHelp),
 				layout.NewSpacer(), container.NewVBox(audioBitPerfect, audioBitPerfectHelp),
+				layout.NewSpacer(), container.NewVBox(dacWarmUp, dacWarmUpHelp,
+					container.NewHBox(widget.NewLabel(lang.L("Duration")), dacWarmUpDuration, widget.NewLabel(lang.L("s"))),
+				),
+				layout.NewSpacer(), container.NewVBox(sampleRatePause, sampleRatePauseHelp,
+					container.NewHBox(widget.NewLabel(lang.L("Duration")), sampleRatePauseDuration, widget.NewLabel(lang.L("ms"))),
+				),
 			)),
 		pauseFade,
 		s.newSectionSeparator(),
@@ -1007,6 +1059,22 @@ func (s *SettingsDialog) onAudioBitPerfectSettingsChanged() error {
 		return s.OnAudioBitPerfectSettingChanged()
 	}
 	return nil
+}
+
+func (s *SettingsDialog) onOutputStabilizationSettingsChanged() {
+	if s.OnOutputStabilizationSettingsChanged != nil {
+		s.OnOutputStabilizationSettingsChanged()
+	}
+}
+
+func clampSettingsInt(v, minValue, maxValue int) int {
+	if v < minValue {
+		return minValue
+	}
+	if v > maxValue {
+		return maxValue
+	}
+	return v
 }
 
 func (s *SettingsDialog) CreateRenderer() fyne.WidgetRenderer {

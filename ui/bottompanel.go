@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/dweymouth/supersonic/backend"
 	"github.com/dweymouth/supersonic/backend/mediaprovider"
@@ -37,7 +38,12 @@ func NewBottomPanel(pm *backend.PlaybackManager, im *backend.ImageManager, contr
 	bp := &BottomPanel{cfg: cfg}
 	bp.ExtendBaseWidget(bp)
 
-	pm.OnSongChange(bp.onSongChange)
+	pm.OnSongChange(func(song mediaprovider.MediaItem, justScrobbled *mediaprovider.Track) {
+		bp.onSongChange(song, justScrobbled)
+		fyne.Do(func() {
+			bp.updateSoftwareVolumeLock(pm)
+		})
+	})
 	pm.OnRadioMetadataChange(bp.onRadioMetadataChange)
 	pm.OnWaveformImgUpdate(bp.updateWaveformImg)
 	pm.OnPlayTimeUpdate(func(cur, total float64, _ bool) {
@@ -45,16 +51,21 @@ func NewBottomPanel(pm *backend.PlaybackManager, im *backend.ImageManager, contr
 			if !pm.IsSeeking() {
 				bp.Controls.UpdatePlayTime(cur, total)
 			}
-			bp.updateSoftwareVolumeLock(pm)
 		})
 	})
 
-	pm.OnPaused(util.FyneDoFunc(func() { bp.Controls.SetPlaying(false) }))
-	pm.OnPlaying(util.FyneDoFunc(func() { bp.Controls.SetPlaying(true) }))
+	pm.OnPaused(util.FyneDoFunc(func() {
+		bp.Controls.SetPlaying(false)
+		bp.updateSoftwareVolumeLock(pm)
+	}))
+	pm.OnPlaying(util.FyneDoFunc(func() {
+		bp.Controls.SetPlaying(true)
+		bp.updateSoftwareVolumeLock(pm)
+	}))
 	pm.OnStopped(util.FyneDoFunc(func() {
 		bp.Controls.SetPlaying(false)
 		bp.Controls.UpdatePlayTime(0, 0)
-		bp.AuxControls.VolumeControl.SetSoftwareVolumeLocked(false, "")
+		bp.updateSoftwareVolumeLock(pm)
 	}))
 
 	bp.NowPlaying = widgets.NewNowPlayingCard()
@@ -147,6 +158,7 @@ func NewBottomPanel(pm *backend.PlaybackManager, im *backend.ImageManager, contr
 
 	bp.imageLoader = util.NewThumbnailLoader(im, bp.NowPlaying.SetImage)
 	bp.updateSoftwareVolumeLock(pm)
+	bp.startQualityRefreshLoop(pm)
 
 	bp.container = container.New(layouts.NewLeftMiddleRightLayout(300, 0.4),
 		bp.NowPlaying, bp.Controls, bp.AuxControls)
@@ -173,6 +185,20 @@ func (bp *BottomPanel) updateSoftwareVolumeLock(pm *backend.PlaybackManager) {
 	}
 	bp.AuxControls.SetQualityPath(quality)
 	bp.AuxControls.VolumeControl.SetSoftwareVolumeLocked(locked, reason)
+}
+
+func (bp *BottomPanel) startQualityRefreshLoop(pm *backend.PlaybackManager) {
+	tick := time.NewTicker(time.Second)
+	go func() {
+		for range tick.C {
+			if pm.PlaybackStatus().State == player.Stopped {
+				continue
+			}
+			fyne.Do(func() {
+				bp.updateSoftwareVolumeLock(pm)
+			})
+		}
+	}()
 }
 
 func qualityPathInfo(info player.MediaInfo) widgets.QualityPathInfo {

@@ -15,7 +15,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
         with:
           path-type: inherit
           update: true
@@ -23,8 +23,10 @@ jobs:
             wget
             zip
             p7zip
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d
+        with:
+          cache: false
       - name: Install Dependencies
         run: >
           pacman -Syu &&
@@ -41,18 +43,18 @@ jobs:
         run: >
           zip Supersonic_windows_x64.zip Supersonic.exe *.dll
       - name: Generate installer
-        uses: Minionguyjpro/Inno-Setup-Action@v1.2.8
+        uses: Minionguyjpro/Inno-Setup-Action@202dd0c4950ef315b6ba13359998fe120179b147
         with:
           path: win_inno_installscript.iss
       - name: Rename installer
         run: cp Output/supersonic-installer.exe Supersonic_windows_x64_installer.exe
       - name: Upload zip
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: Supersonic_windows_x64.zip
           path: Supersonic_windows_x64.zip
       - name: Upload installer
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: Supersonic_windows_x64_installer.exe
           path: Supersonic_windows_x64_installer.exe
@@ -62,12 +64,14 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - name: Set up Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
         with:
           xcode-version: latest
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d
+        with:
+          cache: false
       - name: Install Dependencies
         run: brew install --force ffmpeg wavpack dylibbundler
       - name: Setup path
@@ -80,7 +84,7 @@ jobs:
       - name: Rename artifact
         run: mv Supersonic.zip Supersonic_mac_arm64.zip
       - name: Upload package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: Supersonic_mac_arm64.zip
           path: Supersonic_mac_arm64.zip
@@ -90,12 +94,14 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - name: Set up Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
         with:
           xcode-version: latest
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d
+        with:
+          cache: false
       - name: Install Dependencies
         run: brew install --force ffmpeg wavpack dylibbundler
       - name: Setup path
@@ -107,7 +113,7 @@ jobs:
           mise run zip:macos &&
           mv Supersonic.zip Supersonic_mac_x64.zip
       - name: Upload package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: Supersonic_mac_x64.zip
           path: Supersonic_mac_x64.zip
@@ -117,8 +123,10 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d
+        with:
+          cache: false
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y libavformat-dev libavcodec-dev libavfilter-dev libavutil-dev libswresample-dev libswscale-dev libwavpack-dev gcc libegl1-mesa-dev xorg-dev
       - name: Fyne package
@@ -126,7 +134,7 @@ jobs:
       - name: Rename artifact
         run: mv Supersonic.tar.xz Supersonic_ubuntu22.04_x64.tar.xz
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: Supersonic_ubuntu22.04_x64.tar.xz
           path: Supersonic_ubuntu22.04_x64.tar.xz
@@ -136,8 +144,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d
+        with:
+          cache: false
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y libavformat-dev libavcodec-dev libavfilter-dev libavutil-dev libswresample-dev libswscale-dev libwavpack-dev gcc libegl1-mesa-dev xorg-dev
       - name: Fyne package
@@ -145,7 +155,7 @@ jobs:
       - name: Rename artifact
         run: mv Supersonic.tar.xz Supersonic_ubuntu24.04_x64.tar.xz
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: Supersonic_ubuntu24.04_x64.tar.xz
           path: Supersonic_ubuntu24.04_x64.tar.xz
@@ -155,8 +165,10 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d
+        with:
+          cache: false
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y libavformat-dev libavcodec-dev libavfilter-dev libavutil-dev libswresample-dev libswscale-dev libwavpack-dev gcc libegl1-mesa-dev xorg-dev
       - name: Build
@@ -166,7 +178,7 @@ jobs:
           chmod +x ./scripts/appimage-build.sh
           ./scripts/appimage-build.sh
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: Supersonic-x86_64.AppImage
           path: Supersonic-x86_64.AppImage
@@ -185,7 +197,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: artifacts
           merge-multiple: true

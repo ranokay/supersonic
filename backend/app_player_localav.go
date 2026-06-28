@@ -5,7 +5,6 @@ package backend
 import (
 	"fmt"
 
-	"github.com/dweymouth/supersonic/backend/player"
 	"github.com/dweymouth/supersonic/backend/player/localav"
 )
 
@@ -17,9 +16,4 @@ func (a *App) initLocalPlayer() error {
 	}
 	a.LocalPlayer = p
 	return nil
-}
-
-// localPlayerSetup performs player-specific post-init setup (localav variant).
-func (a *App) localPlayerSetup(p player.LocalPlayer) {
-	// localav has no extra setup beyond what setupLocalPlayer does.
 }

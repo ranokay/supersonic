@@ -74,7 +74,7 @@ ubuntu 22.04+ <br/>
 debian 12+ <br/> 
 fedora 42+ <br/> 
 
-* **(Debian) .tar.xz:** The .tar.xz builds from the Releases page support Debian-based distros. Install the distro FFmpeg runtime libraries if they are not already present, then extract the bundle and run `make user-install` or `sudo make install`.
+* **(Debian) .tar.xz:** The .tar.xz builds from the Releases page support Debian-based distros. Install the distro FFmpeg runtime libraries if they are not already present, extract the bundle, and run the included `Supersonic` executable. For a system install, copy the extracted application files to your preferred location such as `/opt/Supersonic`.
 
 * **Packages:** On Linux, Supersonic is [available as a Flatpak](https://flathub.org/apps/details/io.github.dweymouth.supersonic). (Thank you @anarcat!) Third-party packages are also available for Arch and Nix OS. **Please note** that the Flatpak package currently does not support CJK fonts as the sandboxing breaks font lookup.
 

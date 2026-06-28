@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dweymouth/supersonic/backend/mediaprovider"
@@ -18,6 +21,13 @@ import (
 	"github.com/go-audio/wav"
 	mpv "github.com/supersonic-app/go-mpv"
 )
+
+// Buffer pool for mpv waveform analysis to reduce allocations.
+var audioBufferPool = sync.Pool{
+	New: func() any {
+		return &audio.IntBuffer{Data: make([]int, 4096)}
+	},
+}
 
 func (w *WaveformImageGenerator) StartWaveformGeneration(item *mediaprovider.Track) *WaveformImageJob {
 	ctx, cancel := context.WithCancel(w.audioCache.rootCtx)
@@ -38,6 +48,7 @@ func (w *WaveformImageGenerator) StartWaveformGeneration(item *mediaprovider.Tra
 			}
 			path = w.audioCache.ObtainReferenceToFile(job.ItemID)
 		}
+		defer w.audioCache.ReleaseReferenceToFile(job.ItemID)
 		// and wait for content to begin being written
 		for {
 			if s, err := os.Stat(path); err == nil && s.Size() > 0 {
@@ -79,18 +90,22 @@ func (w *WaveformImageGenerator) StartWaveformGeneration(item *mediaprovider.Tra
 
 			path = srv.Addr()
 
-			go srv.Serve()
+			serveErr := make(chan error, 1)
+			go func() { serveErr <- srv.Serve() }()
+			defer func() {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer stopCancel()
+				_ = srv.Stop(stopCtx)
+				<-serveErr
+			}()
 			time.Sleep(10 * time.Millisecond) // make sure server has time to come up
 		}
 
 		// Start converting the file to WAV for analysis
-		var wavConvertDone bool
+		var wavConvertDone atomic.Bool
+		convertDone := make(chan error, 1)
 		go func() {
-			err := w.convertToWav(ctx, job.ItemID, path, transcodeFile)
-			wavConvertDone = true
-			if err != nil {
-				job.setError(err)
-			}
+			convertDone <- w.convertToWav(ctx, path, transcodeFile)
 		}()
 
 		// Wait for transcoded WAV file to begin being written
@@ -98,17 +113,32 @@ func (w *WaveformImageGenerator) StartWaveformGeneration(item *mediaprovider.Tra
 			if s, err := os.Stat(transcodeFile); err == nil && s.Size() > 0 {
 				break
 			}
-			time.Sleep(50 * time.Millisecond)
-			if e := ctx.Err(); e != nil {
-				job.setError(e)
+			select {
+			case err := <-convertDone:
+				wavConvertDone.Store(true)
+				if err != nil {
+					job.setError(err)
+					return
+				}
+				job.setError(fmt.Errorf("WAV conversion completed without creating %s", transcodeFile))
+				return
+			case <-time.After(50 * time.Millisecond):
+			case <-ctx.Done():
+				job.setError(ctx.Err())
 				return
 			}
 		}
+		go func() {
+			if err := <-convertDone; err != nil {
+				job.setError(err)
+			}
+			wavConvertDone.Store(true)
+		}()
 
 		// Start analyzing the converted wav file
 		data := &waveformData{notify: make(chan struct{}, 1)}
 		go func() {
-			err := analyzeWavFile(ctx, transcodeFile, data, item.Duration.Milliseconds(), func() bool { return wavConvertDone })
+			err := analyzeWavFile(ctx, transcodeFile, data, item.Duration.Milliseconds(), wavConvertDone.Load)
 			if err != nil {
 				job.setError(err)
 			}
@@ -124,13 +154,15 @@ func (w *WaveformImageGenerator) StartWaveformGeneration(item *mediaprovider.Tra
 		// Start generating the waveform image
 		go func() {
 			generateWaveformImage(ctx, data, job)
+			job.lock.Lock()
 			job.done = true
+			job.lock.Unlock()
 		}()
 	}()
 	return job
 }
 
-func (w *WaveformImageGenerator) convertToWav(ctx context.Context, id, inPath, outPath string) error {
+func (w *WaveformImageGenerator) convertToWav(ctx context.Context, inPath, outPath string) error {
 	m := mpv.Create()
 	m.SetOptionString("video", "no")
 	m.SetOptionString("audio-display", "no")
@@ -151,7 +183,6 @@ func (w *WaveformImageGenerator) convertToWav(ctx context.Context, id, inPath, o
 	defer m.TerminateDestroy()
 
 	m.Command([]string{"loadfile", inPath, "replace"})
-	defer w.audioCache.ReleaseReferenceToFile(id)
 
 	// Wait for MPV idle or ctx expiry
 	for {
@@ -177,6 +208,30 @@ func (w *WaveformImageGenerator) convertToWav(ctx context.Context, id, inPath, o
 			}
 		}
 	}
+}
+
+func computePeakAndRMS(chunk []float64) (peak float64, rms float64) {
+	var sumSquares float64
+	for _, v := range chunk {
+		if v > peak {
+			peak = v
+		} else if v < -peak {
+			peak = -v
+		}
+		sumSquares += v * v
+	}
+	rms = math.Sqrt(sumSquares / float64(len(chunk)))
+	return peak, rms
+}
+
+func float64ToByte(val float64) byte {
+	if val > 1.0 {
+		val = 1.0
+	}
+	if val < 0.0 {
+		val = 0.0
+	}
+	return byte(val * 255)
 }
 
 // assumes mono, 16 bit

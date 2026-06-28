@@ -260,31 +260,39 @@ func (p *Player) SetReplayGainOptions(options player.ReplayGainOptions) error {
 // Unlike most Player functions, SetAudioExclusive can be called
 // before Init, to set the initial option of the player on startup.
 func (p *Player) SetAudioExclusive(tf bool) error {
-	p.audioExclusive = tf
+	nextBitPerfect := p.audioBitPerfect
 	if !tf {
-		p.audioBitPerfect = false
+		nextBitPerfect = false
 	}
 	if p.initialized {
 		val := "no"
 		if tf {
 			val = "yes"
 		}
-		return p.mpv.SetOptionString("audio-exclusive", val)
+		if err := p.mpv.SetOptionString("audio-exclusive", val); err != nil {
+			return err
+		}
 	}
+	p.audioExclusive = tf
+	p.audioBitPerfect = nextBitPerfect
 	return nil
 }
 
 func (p *Player) SetAudioBitPerfect(tf bool) error {
-	p.audioBitPerfect = tf
 	if tf {
-		return p.SetAudioExclusive(true)
+		if err := p.SetAudioExclusive(true); err != nil {
+			return err
+		}
 	}
+	p.audioBitPerfect = tf
 	return nil
 }
 
 func (p *Player) SetPauseFade(pauseFade bool) {
 	p.pauseFade = pauseFade
 }
+
+func (p *Player) SetOutputStabilizationOptions(player.OutputStabilizationOptions) {}
 
 // Gets the current volume of the player.
 func (p *Player) GetVolume() int {

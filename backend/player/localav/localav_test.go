@@ -1,4 +1,4 @@
-//go:build !mpv
+//go:build !mpv && darwin && integration
 
 package localav_test
 
@@ -20,18 +20,13 @@ func TestPlayerBasic(t *testing.T) {
 
 	stopped := make(chan struct{}, 1)
 	p.OnStopped(func() { stopped <- struct{}{} })
-	p.OnPlaying(func() { t.Log("OnPlaying fired") })
 
 	err := p.PlayFile("/System/Library/Sounds/Ping.aiff", mediaprovider.MediaItemMetadata{}, 0)
 	if err != nil {
 		t.Fatalf("PlayFile: %v", err)
 	}
 
-	// Should be playing
-	status := p.GetStatus()
-	if status.State != player.Playing {
-		t.Errorf("expected Playing, got %v", status.State)
-	}
+	waitForState(t, p, player.Playing, time.Second)
 
 	// Wait for natural end (Ping is ~0.5s)
 	select {
@@ -53,22 +48,17 @@ func TestPlayerPauseResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlayFile: %v", err)
 	}
-	time.Sleep(100 * time.Millisecond)
+	waitForState(t, p, player.Playing, time.Second)
 
 	if err := p.Pause(); err != nil {
 		t.Fatalf("Pause: %v", err)
 	}
-	if s := p.GetStatus().State; s != player.Paused {
-		t.Errorf("expected Paused, got %v", s)
-	}
+	waitForState(t, p, player.Paused, time.Second)
 
-	time.Sleep(50 * time.Millisecond)
 	if err := p.Continue(); err != nil {
 		t.Fatalf("Continue: %v", err)
 	}
-	if s := p.GetStatus().State; s != player.Playing {
-		t.Errorf("expected Playing after Continue, got %v", s)
-	}
+	waitForState(t, p, player.Playing, time.Second)
 
 	p.Stop(false)
 }
@@ -85,7 +75,7 @@ func TestPlayerSeek(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlayFile: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	waitForState(t, p, player.Playing, time.Second)
 
 	if err := p.SeekSeconds(1.0); err != nil {
 		t.Fatalf("SeekSeconds: %v", err)
@@ -97,6 +87,23 @@ func TestPlayerSeek(t *testing.T) {
 		t.Errorf("position after seek = %v, expected ~1.0", pos)
 	}
 	p.Stop(false)
+}
+
+func waitForState(t *testing.T, p *localav.Player, want player.State, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := p.GetStatus().State; got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for state %v; got %v", want, p.GetStatus().State)
+		case <-ticker.C:
+		}
+	}
 }
 
 func TestPlayerListDevices(t *testing.T) {

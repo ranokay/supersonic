@@ -4,21 +4,11 @@ import (
 	"context"
 	"image"
 	"image/color"
-	"math"
 	"sync"
-
-	"github.com/go-audio/audio"
 )
 
 type WaveformImageGenerator struct {
 	audioCache *AudioCache
-}
-
-// Buffer pool for waveform analysis to reduce allocations
-var audioBufferPool = sync.Pool{
-	New: func() any {
-		return &audio.IntBuffer{Data: make([]int, 4096)}
-	},
 }
 
 type WaveformImage = image.NRGBA
@@ -154,31 +144,6 @@ func (j *WaveformImageJob) setError(err error) {
 	defer j.lock.Unlock()
 
 	j.err = err
-}
-
-func computePeakAndRMS(chunk []float64) (peak float64, rms float64) {
-	var sumSquares float64
-	peak = 0.0
-	for _, v := range chunk {
-		if v > peak {
-			peak = v
-		} else if v < -peak {
-			peak = -v
-		}
-		sumSquares += float64(v * v)
-	}
-	rms = math.Sqrt(sumSquares / float64(len(chunk)))
-	return peak, rms
-}
-
-func float64ToByte(val float64) byte {
-	if val > 1.0 {
-		val = 1.0
-	}
-	if val < 0.0 {
-		val = 0.0
-	}
-	return byte(val * 255)
 }
 
 func setPixel(img *image.NRGBA, x, y int, c color.NRGBA) {

@@ -49,10 +49,114 @@
 #define AVPLAYER_MAX_DOP_CHANNELS 8
 
 static int handle_eof_and_gapless(av_player_t *p);
+static int32_t dop_pack_s32(uint8_t marker, uint8_t dsd0, uint8_t dsd1);
+
+#if LIBAVCODEC_VERSION_MAJOR >= 59
+#define AVPLAYER_HAVE_AV_CHANNEL_LAYOUT 1
+#else
+#define AVPLAYER_HAVE_AV_CHANNEL_LAYOUT 0
+#endif
+
+static uint64_t avplayer_default_channel_layout_mask(int channels) {
+    if (channels <= 0) channels = AVPLAYER_DEFAULT_CHANNELS;
+#if AVPLAYER_HAVE_AV_CHANNEL_LAYOUT
+    AVChannelLayout layout;
+    av_channel_layout_default(&layout, channels);
+    uint64_t mask = layout.u.mask;
+    av_channel_layout_uninit(&layout);
+    return mask;
+#else
+    return (uint64_t)av_get_default_channel_layout(channels);
+#endif
+}
+
+static int avplayer_codec_channels(const AVCodecContext *ctx) {
+    if (!ctx) return 0;
+#if AVPLAYER_HAVE_AV_CHANNEL_LAYOUT
+    return ctx->ch_layout.nb_channels;
+#else
+    return ctx->channels;
+#endif
+}
+
+static uint64_t avplayer_codec_channel_layout_mask(const AVCodecContext *ctx) {
+    if (!ctx) return 0;
+#if AVPLAYER_HAVE_AV_CHANNEL_LAYOUT
+    if (ctx->ch_layout.u.mask) return ctx->ch_layout.u.mask;
+#else
+    if (ctx->channel_layout) return (uint64_t)ctx->channel_layout;
+#endif
+    return avplayer_default_channel_layout_mask(avplayer_codec_channels(ctx));
+}
+
+static void avplayer_codec_force_default_layout(AVCodecContext *ctx, int channels) {
+    if (!ctx) return;
+    if (channels <= 0) channels = AVPLAYER_DEFAULT_CHANNELS;
+#if AVPLAYER_HAVE_AV_CHANNEL_LAYOUT
+    av_channel_layout_uninit(&ctx->ch_layout);
+    av_channel_layout_default(&ctx->ch_layout, channels);
+#else
+    ctx->channels = channels;
+    ctx->channel_layout = av_get_default_channel_layout(channels);
+#endif
+}
+
+static void avplayer_codec_set_default_layout(AVCodecContext *ctx, int channels) {
+    if (!ctx) return;
+    if (channels <= 0) channels = AVPLAYER_DEFAULT_CHANNELS;
+#if AVPLAYER_HAVE_AV_CHANNEL_LAYOUT
+    if (!ctx->ch_layout.nb_channels) {
+        av_channel_layout_default(&ctx->ch_layout, channels);
+    }
+    if (!ctx->ch_layout.u.mask) {
+        AVChannelLayout tmp;
+        av_channel_layout_default(&tmp, ctx->ch_layout.nb_channels);
+        av_channel_layout_copy(&ctx->ch_layout, &tmp);
+        av_channel_layout_uninit(&tmp);
+    }
+#else
+    if (ctx->channels <= 0) ctx->channels = channels;
+    if (!ctx->channel_layout) {
+        ctx->channel_layout = av_get_default_channel_layout(ctx->channels);
+    }
+#endif
+}
+
+#if defined(SUPERSONIC_AUDIO_DEBUG)
+#define AV_SPAN_START(name) ma_timer name; ma_timer_init(&(name))
+#define AV_SPAN_DONE(name, label) \
+    AV_DEBUG("%s duration=%.1fms", (label), ma_timer_get_time_in_seconds(&(name)) * 1000.0)
+#else
+#define AV_SPAN_START(name) do { } while (0)
+#define AV_SPAN_DONE(name, label) do { } while (0)
+#endif
 
 // --------------------------------------------------------------------------
 // Internal types
 // --------------------------------------------------------------------------
+
+#if defined(__APPLE__)
+typedef struct {
+    AudioObjectID stream_id;
+    AudioStreamBasicDescription asbd;
+    int score;
+    int bit_depth;
+    int mixable;
+    char label[160];
+} coreaudio_format_choice_t;
+
+static av_device_info_t coreaudio_caps_cache;
+static char coreaudio_caps_cache_uid[256];
+static int coreaudio_caps_cache_valid;
+
+static coreaudio_format_choice_t coreaudio_choice_cache;
+static char coreaudio_choice_cache_uid[256];
+static int coreaudio_choice_cache_rate;
+static int coreaudio_choice_cache_channels;
+static int coreaudio_choice_cache_bits;
+static int coreaudio_choice_cache_dop;
+static int coreaudio_choice_cache_valid;
+#endif
 
 typedef struct decoder {
     AVFormatContext *fmt_ctx;
@@ -141,6 +245,8 @@ typedef struct {
     char                reason[160];
 } output_config_t;
 
+static int output_config_matches_current(const av_player_t *p, const output_config_t *cfg);
+
 struct av_player {
     // Current decoder
     decoder_t       *dec;
@@ -154,6 +260,7 @@ struct av_player {
     int              ma_ctx_init;  // bool: ma_ctx was initialised
     int              device_init;  // bool: device was initialised
     char             device_name[256];
+    char             active_device_request[256];
     int              exclusive_requested;
     int              exclusive_active;
     int              bitperfect_requested;
@@ -182,6 +289,14 @@ struct av_player {
     int              dop_carrier_rate;
     int              dop_active;
     int              dop_marker_phase;
+    int              dac_warmup_enabled;
+    int              dac_warmup_ms;
+    int              dac_warmup_done;
+    int              sample_rate_pause_enabled;
+    int              sample_rate_pause_ms;
+    _Atomic long long stabilization_frames_remaining;
+    int              debug_first_ring_write_logged;
+    int              debug_first_render_logged;
 
 #if defined(__APPLE__)
     AudioObjectID    coreaudio_hog_device;
@@ -569,11 +684,7 @@ static void decoder_open_wavpack_dsd(decoder_t *d) {
         d->duration = (double)samples / (double)byte_rate;
     }
     d->codec_ctx->sample_rate = byte_rate;
-    AVChannelLayout layout;
-    av_channel_layout_default(&layout, channels);
-    av_channel_layout_uninit(&d->codec_ctx->ch_layout);
-    av_channel_layout_copy(&d->codec_ctx->ch_layout, &layout);
-    av_channel_layout_uninit(&layout);
+    avplayer_codec_force_default_layout(d->codec_ctx, channels);
     AV_DEBUG("WavPack DSD native path ready channels=%d dsd_rate=%d carrier=%d qmode=0x%x",
              channels, d->wv_dsd_bit_rate, d->wv_dop_carrier_rate, qmode);
 }
@@ -614,10 +725,7 @@ static int decoder_supports_raw_dop(const decoder_t *d) {
 static int decoder_channel_count(const decoder_t *d) {
     if (!d) return 0;
     if (d->wv_dsd && d->wv_channels > 0) return d->wv_channels;
-    if (d->codec_ctx && d->codec_ctx->ch_layout.nb_channels > 0) {
-        return d->codec_ctx->ch_layout.nb_channels;
-    }
-    return 0;
+    return avplayer_codec_channels(d->codec_ctx);
 }
 
 static int decoder_dsd_is_planar(const decoder_t *d) {
@@ -811,7 +919,7 @@ static int decoder_build_filter_graph(decoder_t *d, const output_config_t *out_c
              "sample_rate=%d:sample_fmt=%s:channel_layout=0x%" PRIx64 ":time_base=%d/%d",
              d->codec_ctx->sample_rate,
              av_get_sample_fmt_name(d->codec_ctx->sample_fmt),
-             (uint64_t)d->codec_ctx->ch_layout.u.mask,
+             avplayer_codec_channel_layout_mask(d->codec_ctx),
              tb.num, tb.den);
 
     AVFilterContext *src_ctx = NULL;
@@ -836,12 +944,9 @@ static int decoder_build_filter_graph(decoder_t *d, const output_config_t *out_c
     // stream so app volume/EQ/ReplayGain remain available even with hog mode.
     char chain[256];
     const char *fmt_name = av_get_sample_fmt_name(out_cfg->av_format);
-    uint64_t layout_mask = d->codec_ctx->ch_layout.u.mask;
+    uint64_t layout_mask = avplayer_codec_channel_layout_mask(d->codec_ctx);
     if (layout_mask == 0) {
-        AVChannelLayout tmp;
-        av_channel_layout_default(&tmp, out_cfg->channels);
-        layout_mask = tmp.u.mask;
-        av_channel_layout_uninit(&tmp);
+        layout_mask = avplayer_default_channel_layout_mask(out_cfg->channels);
     }
     if (out_cfg->bitperfect && out_cfg->bitperfect_candidate) {
         snprintf(chain, sizeof(chain),
@@ -973,15 +1078,25 @@ static int decoder_open(decoder_t *d, const char *url) {
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);
     av_dict_set(&opts, "user_agent", "supersonic/1.0", 0);
 
+    AV_SPAN_START(open_input_span);
     int ret = avformat_open_input(&d->fmt_ctx, url, NULL, &opts);
+    AV_SPAN_DONE(open_input_span, "decoder avformat_open_input");
     av_dict_free(&opts);
     if (ret < 0) return ret;
 
+    AV_SPAN_START(stream_info_span);
     ret = avformat_find_stream_info(d->fmt_ctx, NULL);
+    AV_SPAN_DONE(stream_info_span, "decoder avformat_find_stream_info");
     if (ret < 0) { avformat_close_input(&d->fmt_ctx); return ret; }
 
+    AV_SPAN_START(best_stream_span);
+#if AVPLAYER_HAVE_AV_CHANNEL_LAYOUT
     const AVCodec *codec = NULL;
+#else
+    AVCodec *codec = NULL;
+#endif
     int stream_idx = av_find_best_stream(d->fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+    AV_SPAN_DONE(best_stream_span, "decoder av_find_best_stream");
     if (stream_idx < 0) {
         avformat_close_input(&d->fmt_ctx);
         return stream_idx;
@@ -994,21 +1109,12 @@ static int decoder_open(decoder_t *d, const char *url) {
     ret = avcodec_parameters_to_context(d->codec_ctx, d->fmt_ctx->streams[stream_idx]->codecpar);
     if (ret < 0) goto fail;
 
+    AV_SPAN_START(codec_open_span);
     ret = avcodec_open2(d->codec_ctx, codec, NULL);
+    AV_SPAN_DONE(codec_open_span, "decoder avcodec_open2");
     if (ret < 0) goto fail;
 
-    // Ensure we have a valid channel layout
-    if (!d->codec_ctx->ch_layout.nb_channels) {
-        av_channel_layout_default(&d->codec_ctx->ch_layout, 2);
-    }
-    if (!d->codec_ctx->ch_layout.u.mask) {
-        // Convert from nb_channels if mask is 0
-        AVChannelLayout tmp = AV_CHANNEL_LAYOUT_STEREO;
-        if (d->codec_ctx->ch_layout.nb_channels == 1) {
-            tmp = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
-        }
-        av_channel_layout_copy(&d->codec_ctx->ch_layout, &tmp);
-    }
+    avplayer_codec_set_default_layout(d->codec_ctx, AVPLAYER_DEFAULT_CHANNELS);
 
     double dur_secs = 0.0;
     if (d->fmt_ctx->duration > 0) {
@@ -1032,6 +1138,58 @@ fail:
 // Audio render callbacks
 // --------------------------------------------------------------------------
 
+static int clamp_int(int value, int min_value, int max_value) {
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static void player_fill_dop_silence(av_player_t *p, void *output, ma_uint32 frame_count, int channels) {
+    int32_t *out = (int32_t *)output;
+    for (ma_uint32 frame = 0; frame < frame_count; frame++) {
+        uint8_t marker = (p->dop_marker_phase & 1) ? 0xfa : 0x05;
+        for (int ch = 0; ch < channels; ch++) {
+            out[frame * (ma_uint32)channels + (ma_uint32)ch] = dop_pack_s32(marker, 0x69, 0x69);
+        }
+        p->dop_marker_phase ^= 1;
+    }
+}
+
+static int player_render_stabilization_silence(av_player_t *p,
+                                               void *output,
+                                               ma_uint32 frame_count,
+                                               int channels,
+                                               int bytes_per_frame) {
+    long long remaining = atomic_load_explicit(&p->stabilization_frames_remaining, memory_order_relaxed);
+    if (remaining <= 0) return 0;
+
+    if (p->dop_active && p->output_format == ma_format_s32) {
+        player_fill_dop_silence(p, output, frame_count, channels);
+    } else {
+        memset(output, 0, (size_t)frame_count * (size_t)bytes_per_frame);
+    }
+
+    long long consumed = remaining < (long long)frame_count ? remaining : (long long)frame_count;
+    long long after = atomic_fetch_sub_explicit(&p->stabilization_frames_remaining,
+                                                consumed,
+                                                memory_order_relaxed) - consumed;
+    if (after <= 0) {
+        atomic_store_explicit(&p->stabilization_frames_remaining, 0, memory_order_relaxed);
+        AV_DEBUG("output stabilization complete");
+    }
+    atomic_store_explicit((_Atomic double *)&p->l_peak, -INFINITY, memory_order_relaxed);
+    atomic_store_explicit((_Atomic double *)&p->r_peak, -INFINITY, memory_order_relaxed);
+    atomic_store_explicit((_Atomic double *)&p->l_rms,  -INFINITY, memory_order_relaxed);
+    atomic_store_explicit((_Atomic double *)&p->r_rms,  -INFINITY, memory_order_relaxed);
+    return 1;
+}
+
+static void player_log_first_ring_write(av_player_t *p, int frames) {
+    if (!p || frames <= 0 || p->debug_first_ring_write_logged) return;
+    p->debug_first_ring_write_logged = 1;
+    AV_DEBUG("first ring write frames=%d buffered=%d", frames, ring_avail(&p->ring));
+}
+
 static void player_render_audio(av_player_t *p, void *output, ma_uint32 frame_count) {
     int channels = p->ring.channels > 0 ? p->ring.channels : AVPLAYER_DEFAULT_CHANNELS;
     int bytes_per_frame = p->ring.bytes_per_frame > 0
@@ -1044,10 +1202,18 @@ static void player_render_audio(av_player_t *p, void *output, ma_uint32 frame_co
         return;
     }
 
+    if (player_render_stabilization_silence(p, output, frame_count, channels, bytes_per_frame)) {
+        return;
+    }
+
     int got = ring_read(&p->ring, output, (int)frame_count);
     if (got > 0)
         atomic_fetch_add_explicit((_Atomic long long *)&p->frames_played_total,
                                   (long long)got, memory_order_relaxed);
+    if (got > 0 && !p->debug_first_render_logged) {
+        p->debug_first_render_logged = 1;
+        AV_DEBUG("first render frames=%d buffered=%d", got, ring_avail(&p->ring));
+    }
 
     // Compute peaks from pre-volume PCM (represents the demuxed/decoded signal).
     if (p->peaks_enabled && got > 0 && p->output_format == ma_format_f32) {
@@ -1155,15 +1321,6 @@ static void ma_data_callback(ma_device *device, void *output, const void *input,
 #ifndef kAudioObjectPropertyElementMain
 #define kAudioObjectPropertyElementMain 0
 #endif
-
-typedef struct {
-    AudioObjectID stream_id;
-    AudioStreamBasicDescription asbd;
-    int score;
-    int bit_depth;
-    int mixable;
-    char label[160];
-} coreaudio_format_choice_t;
 
 static void player_release_coreaudio_hog(av_player_t *p);
 
@@ -1398,6 +1555,28 @@ static void coreaudio_fill_device_caps(AudioObjectID device_id, av_device_info_t
              max_rate > 0 ? (double)max_rate / 1000.0 : 0.0);
 }
 
+static const char *coreaudio_cache_uid(const char *uid) {
+    return (uid && uid[0]) ? uid : "<default>";
+}
+
+static void coreaudio_fill_device_caps_cached(const char *uid,
+                                              AudioObjectID device_id,
+                                              av_device_info_t *info) {
+    const char *key = coreaudio_cache_uid(uid);
+    if (coreaudio_caps_cache_valid && strcmp(coreaudio_caps_cache_uid, key) == 0) {
+        *info = coreaudio_caps_cache;
+        AV_DEBUG("CoreAudio caps cache hit uid=%s", key);
+        return;
+    }
+    memset(info, 0, sizeof(*info));
+    coreaudio_fill_device_caps(device_id, info);
+    coreaudio_caps_cache = *info;
+    strncpy(coreaudio_caps_cache_uid, key, sizeof(coreaudio_caps_cache_uid) - 1);
+    coreaudio_caps_cache_uid[sizeof(coreaudio_caps_cache_uid) - 1] = '\0';
+    coreaudio_caps_cache_valid = 1;
+    AV_DEBUG("CoreAudio caps cache miss uid=%s", key);
+}
+
 static int coreaudio_score_format(const AudioStreamBasicDescription *asbd,
                                   int target_rate,
                                   int target_channels,
@@ -1499,6 +1678,47 @@ static int coreaudio_choose_physical_format(AudioObjectID device_id,
 
     free(streams);
     return choice->score >= 0 ? 0 : -1;
+}
+
+static int coreaudio_choose_physical_format_cached(AudioObjectID device_id,
+                                                   const char *uid,
+                                                   int target_rate,
+                                                   int target_channels,
+                                                   int target_bits,
+                                                   int dop,
+                                                   coreaudio_format_choice_t *choice) {
+    const char *key = coreaudio_cache_uid(uid);
+    if (coreaudio_choice_cache_valid &&
+        strcmp(coreaudio_choice_cache_uid, key) == 0 &&
+        coreaudio_choice_cache_rate == target_rate &&
+        coreaudio_choice_cache_channels == target_channels &&
+        coreaudio_choice_cache_bits == target_bits &&
+        coreaudio_choice_cache_dop == dop) {
+        *choice = coreaudio_choice_cache;
+        AV_DEBUG("CoreAudio physical format cache hit uid=%s rate=%d channels=%d bits=%d dop=%d",
+                 key, target_rate, target_channels, target_bits, dop);
+        return 0;
+    }
+
+    int ret = coreaudio_choose_physical_format(device_id,
+                                               target_rate,
+                                               target_channels,
+                                               target_bits,
+                                               dop,
+                                               choice);
+    if (ret == 0) {
+        coreaudio_choice_cache = *choice;
+        strncpy(coreaudio_choice_cache_uid, key, sizeof(coreaudio_choice_cache_uid) - 1);
+        coreaudio_choice_cache_uid[sizeof(coreaudio_choice_cache_uid) - 1] = '\0';
+        coreaudio_choice_cache_rate = target_rate;
+        coreaudio_choice_cache_channels = target_channels;
+        coreaudio_choice_cache_bits = target_bits;
+        coreaudio_choice_cache_dop = dop;
+        coreaudio_choice_cache_valid = 1;
+    }
+    AV_DEBUG("CoreAudio physical format cache miss uid=%s rate=%d channels=%d bits=%d dop=%d ret=%d",
+             key, target_rate, target_channels, target_bits, dop, ret);
+    return ret;
 }
 
 static int coreaudio_set_hog_mode(AudioObjectID device_id, int enabled) {
@@ -1610,6 +1830,7 @@ static int player_init_coreaudio_ioproc(av_player_t *p,
                                         const char *uid,
                                         const char *display_name,
                                         const output_config_t *out_cfg) {
+    AV_SPAN_START(coreaudio_ioproc_span);
     AudioObjectID device_id = kAudioObjectUnknown;
     if (coreaudio_device_for_uid(uid, &device_id) != 0) {
         set_bitperfect_reason(p, "CoreAudio device lookup failed");
@@ -1618,7 +1839,7 @@ static int player_init_coreaudio_ioproc(av_player_t *p,
 
     av_device_info_t caps;
     memset(&caps, 0, sizeof(caps));
-    coreaudio_fill_device_caps(device_id, &caps);
+    coreaudio_fill_device_caps_cached(uid, device_id, &caps);
 
     int target_bits = ma_format_bit_depth(out_cfg->ma_format);
     if (target_bits <= 0) {
@@ -1627,12 +1848,13 @@ static int player_init_coreaudio_ioproc(av_player_t *p,
     }
 
     coreaudio_format_choice_t choice;
-    if (coreaudio_choose_physical_format(device_id,
-                                         out_cfg->sample_rate,
-                                         out_cfg->channels,
-                                         target_bits,
-                                         out_cfg->dop,
-                                         &choice) != 0 ||
+    if (coreaudio_choose_physical_format_cached(device_id,
+                                                uid,
+                                                out_cfg->sample_rate,
+                                                out_cfg->channels,
+                                                target_bits,
+                                                out_cfg->dop,
+                                                &choice) != 0 ||
         choice.mixable) {
         set_bitperfect_reason(p, out_cfg->dop
                               ? "no matching non-mixable CoreAudio DoP carrier format"
@@ -1718,6 +1940,7 @@ static int player_init_coreaudio_ioproc(av_player_t *p,
     p->device_channels = caps.channels;
 
     AV_DEBUG("CoreAudio IOProc active format=%s", choice.label);
+    AV_SPAN_DONE(coreaudio_ioproc_span, "CoreAudio IOProc init");
     return 0;
 }
 
@@ -1737,7 +1960,82 @@ static void player_release_exclusive(av_player_t *p) {
     p->exclusive_active = 0;
 }
 
+static int player_has_active_output_device(const av_player_t *p) {
+#if defined(__APPLE__)
+    if (p->coreaudio_io_active) return 1;
+#endif
+    return p->device_init;
+}
+
+static int player_can_reuse_output_device(const av_player_t *p,
+                                          const char *device_name,
+                                          const output_config_t *out_cfg) {
+    const char *requested = device_name ? device_name : "";
+    return player_has_active_output_device(p) &&
+           strcmp(p->active_device_request, requested) == 0 &&
+           output_config_matches_current(p, out_cfg);
+}
+
+static void player_schedule_output_stabilization(av_player_t *p,
+                                                 const output_config_t *out_cfg,
+                                                 int previous_sample_rate) {
+    if (!p || !out_cfg) return;
+
+#if defined(__APPLE__)
+    if (!p->coreaudio_io_active && p->coreaudio_hog_device == kAudioObjectUnknown) {
+        atomic_store_explicit(&p->stabilization_frames_remaining, 0, memory_order_relaxed);
+        return;
+    }
+#else
+    if (!p->exclusive_active) {
+        atomic_store_explicit(&p->stabilization_frames_remaining, 0, memory_order_relaxed);
+        return;
+    }
+#endif
+
+    int total_ms = 0;
+    if (p->sample_rate_pause_enabled &&
+        p->sample_rate_pause_ms > 0 &&
+        previous_sample_rate > 0 &&
+        previous_sample_rate != p->output_sample_rate) {
+        total_ms += p->sample_rate_pause_ms;
+        AV_DEBUG("sample-rate switch pause scheduled previous=%d current=%d duration_ms=%d",
+                 previous_sample_rate,
+                 p->output_sample_rate,
+                 p->sample_rate_pause_ms);
+    }
+    if (p->dac_warmup_enabled && p->dac_warmup_ms > 0 && !p->dac_warmup_done) {
+        total_ms += p->dac_warmup_ms;
+        p->dac_warmup_done = 1;
+        AV_DEBUG("DAC warm-up scheduled duration_ms=%d", p->dac_warmup_ms);
+    }
+
+    if (total_ms <= 0 || p->output_sample_rate <= 0) {
+        atomic_store_explicit(&p->stabilization_frames_remaining, 0, memory_order_relaxed);
+        return;
+    }
+
+    long long frames = ((long long)p->output_sample_rate * (long long)total_ms + 999LL) / 1000LL;
+    atomic_store_explicit(&p->stabilization_frames_remaining, frames, memory_order_relaxed);
+    AV_DEBUG("output stabilization active duration_ms=%d frames=%lld dop=%d",
+             total_ms,
+             frames,
+             p->dop_active);
+}
+
 static int player_init_device(av_player_t *p, const char *device_name, const output_config_t *out_cfg) {
+    const char *requested_device = device_name ? device_name : "";
+    if (player_can_reuse_output_device(p, requested_device, out_cfg)) {
+        AV_DEBUG("reusing output device=%s exclusive=%d bitperfect=%d format=%s rate=%d channels=%d",
+                 requested_device[0] ? requested_device : "<default>",
+                 out_cfg->exclusive,
+                 out_cfg->bitperfect,
+                 ma_get_format_name(out_cfg->ma_format),
+                 out_cfg->sample_rate,
+                 out_cfg->channels);
+        return 0;
+    }
+
     player_release_exclusive(p);
     if (p->device_init) {
         ma_device_uninit(&p->device);
@@ -1840,13 +2138,18 @@ static int player_init_device(av_player_t *p, const char *device_name, const out
         p->output_channels = out_cfg->channels;
         p->output_av_format = out_cfg->av_format;
         p->output_bit_depth = out_cfg->bit_depth > 0 ? out_cfg->bit_depth : ma_format_bit_depth(out_cfg->ma_format);
+        strncpy(p->active_device_request, requested_device, sizeof(p->active_device_request) - 1);
+        p->active_device_request[sizeof(p->active_device_request) - 1] = '\0';
         return 0;
     }
 #endif
 
+    AV_SPAN_START(ma_device_init_span);
     if (ma_device_init(&p->ma_ctx, &cfg, &p->device) != MA_SUCCESS) {
+        AV_SPAN_DONE(ma_device_init_span, "miniaudio device_init_failed");
         return -1;
     }
+    AV_SPAN_DONE(ma_device_init_span, "miniaudio device_init");
     p->device_init = 1;
 
 #if defined(__APPLE__)
@@ -1865,7 +2168,7 @@ static int player_init_device(av_player_t *p, const char *device_name, const out
     if (coreaudio_device_for_uid(active_uid, &active_device) == 0) {
         av_device_info_t caps;
         memset(&caps, 0, sizeof(caps));
-        coreaudio_fill_device_caps(active_device, &caps);
+        coreaudio_fill_device_caps_cached(active_uid, active_device, &caps);
         strncpy(p->device_transport, caps.transport, sizeof(p->device_transport) - 1);
         p->device_physical_formats = caps.physical_format_count;
         p->device_exclusive_formats = caps.exclusive_format_count;
@@ -1910,13 +2213,18 @@ static int player_init_device(av_player_t *p, const char *device_name, const out
     p->output_channels = out_cfg->channels;
     p->output_av_format = out_cfg->av_format;
     p->output_bit_depth = out_cfg->bit_depth > 0 ? out_cfg->bit_depth : ma_format_bit_depth(out_cfg->ma_format);
+    strncpy(p->active_device_request, requested_device, sizeof(p->active_device_request) - 1);
+    p->active_device_request[sizeof(p->active_device_request) - 1] = '\0';
 
+    AV_SPAN_START(ma_device_start_span);
     if (ma_device_start(&p->device) != MA_SUCCESS) {
+        AV_SPAN_DONE(ma_device_start_span, "miniaudio device_start_failed");
         player_release_exclusive(p);
         ma_device_uninit(&p->device);
         p->device_init = 0;
         return -1;
     }
+    AV_SPAN_DONE(ma_device_start_span, "miniaudio device_start");
     AV_DEBUG("device started exclusive_active=%d output=%s/%dHz/%dch",
              p->exclusive_active,
              ma_get_format_name(p->output_format),
@@ -1968,6 +2276,7 @@ static void output_config_make_app_pcm_fallback(output_config_t *cfg, const char
 }
 
 static int player_apply_output_config(av_player_t *p, output_config_t *cfg) {
+    int previous_sample_rate = p->output_sample_rate;
     if (ring_reinit(&p->ring, cfg->sample_rate, cfg->channels, cfg->ma_format) != 0) {
         p->bitperfect_active = 0;
         set_bitperfect_reason(p, "failed to allocate output buffer");
@@ -2026,6 +2335,8 @@ device_ready:
         strncpy(p->signal_status, cfg->dop ? "Bit-Perfect DoP" : "Bit-Perfect",
                 sizeof(p->signal_status) - 1);
     }
+
+    player_schedule_output_stabilization(p, cfg, previous_sample_rate);
 
     AV_DEBUG("output config applied exclusive_requested=%d exclusive_active=%d bitperfect_requested=%d bitperfect_active=%d reason=%s",
              p->exclusive_requested,
@@ -2162,6 +2473,12 @@ av_player_t *av_player_create(void) {
     p->output_mixable = 1;
     p->dop_active = 0;
     p->dop_marker_phase = 0;
+    p->dac_warmup_enabled = 0;
+    p->dac_warmup_ms = 3000;
+    p->dac_warmup_done = 0;
+    p->sample_rate_pause_enabled = 1;
+    p->sample_rate_pause_ms = 200;
+    atomic_store_explicit(&p->stabilization_frames_remaining, 0, memory_order_relaxed);
     strncpy(p->playback_path, "SharedMiniaudio", sizeof(p->playback_path) - 1);
     strncpy(p->signal_status, "Shared Output", sizeof(p->signal_status) - 1);
     strncpy(p->dac_format, "f32 Mixable 48000 Hz 2ch", sizeof(p->dac_format) - 1);
@@ -2237,6 +2554,8 @@ void av_player_destroy(av_player_t *p) {
 
 int av_player_open(av_player_t *p, const char *url, double start_time)
 {
+    AV_SPAN_START(open_total_span);
+    AV_DEBUG("av_player_open begin start_time=%.3f url=%s", start_time, url ? url : "<nil>");
     // Stop current playback
     atomic_store(&p->state, AVPLAYER_STATE_STOPPED);
     ring_clear(&p->ring);
@@ -2248,6 +2567,8 @@ int av_player_open(av_player_t *p, const char *url, double start_time)
     atomic_store_explicit((_Atomic double *)&p->position_offset, 0.0, memory_order_relaxed);
     atomic_store_explicit((_Atomic long long *)&p->position_clock_ref, 0LL, memory_order_relaxed);
     memset(&p->bitrate_hist, 0, sizeof(p->bitrate_hist));
+    p->debug_first_ring_write_logged = 0;
+    p->debug_first_render_logged = 0;
 
     // Acquire decoder_lock to prevent racing with av_player_open_next which
     // also reads/frees next_dec under this lock.
@@ -2265,21 +2586,28 @@ int av_player_open(av_player_t *p, const char *url, double start_time)
     decoder_t *d = decoder_alloc();
     if (!d) return AVERROR(ENOMEM);
 
+    AV_SPAN_START(decoder_open_span);
     int ret = decoder_open(d, url);
+    AV_SPAN_DONE(decoder_open_span, "av_player_open decoder_open");
     if (ret < 0) { decoder_free(d); return ret; }
 
     output_config_t out_cfg;
+    AV_SPAN_START(output_config_span);
     choose_output_config(p, d, &out_cfg);
     if (player_apply_output_config(p, &out_cfg) != 0) {
+        AV_SPAN_DONE(output_config_span, "av_player_open output_config_failed");
         decoder_free(d);
         return -1;
     }
+    AV_SPAN_DONE(output_config_span, "av_player_open output_config");
 
     if (out_cfg.dop) {
         decoder_clear_dop_state(d);
         p->dop_marker_phase = 0;
     } else {
+        AV_SPAN_START(filter_graph_span);
         ret = decoder_build_filter_graph(d, &out_cfg);
+        AV_SPAN_DONE(filter_graph_span, "av_player_open filter_graph");
         if (ret < 0) { decoder_free(d); return ret; }
     }
 
@@ -2291,16 +2619,21 @@ int av_player_open(av_player_t *p, const char *url, double start_time)
     p->dec = d;
 
     // Compute and apply RG gain from the newly opened track's tags.
+    AV_SPAN_START(replay_gain_span);
     atomic_store(&p->rg_switch_pending, 0);
     atomic_store_explicit(&p->rg_gain,
         compute_rg_gain(d, p->rg_mode, p->rg_prevent_clip, p->rg_preamp_db),
         memory_order_relaxed);
+    AV_SPAN_DONE(replay_gain_span, "av_player_open replay_gain");
 
     if (start_time > 0.0) {
+        AV_SPAN_START(seek_span);
         av_player_seek(p, start_time);
+        AV_SPAN_DONE(seek_span, "av_player_open initial_seek");
     }
 
     atomic_store(&p->state, AVPLAYER_STATE_PLAYING);
+    AV_SPAN_DONE(open_total_span, "av_player_open total");
     return 0;
 }
 
@@ -2428,6 +2761,26 @@ int av_player_seek(av_player_t *p, double seconds) {
 
 void av_player_set_volume(av_player_t *p, float volume) {
     p->volume = volume;
+}
+
+void av_player_set_output_stabilization(av_player_t *p,
+                                        int dac_warmup_enabled,
+                                        int dac_warmup_ms,
+                                        int sample_rate_pause_enabled,
+                                        int sample_rate_pause_ms) {
+    if (!p) return;
+    p->dac_warmup_enabled = dac_warmup_enabled ? 1 : 0;
+    p->dac_warmup_ms = clamp_int(dac_warmup_ms <= 0 ? 3000 : dac_warmup_ms, 1000, 10000);
+    p->sample_rate_pause_enabled = sample_rate_pause_enabled ? 1 : 0;
+    p->sample_rate_pause_ms = clamp_int(sample_rate_pause_ms, 0, 1000);
+    if (!p->dac_warmup_enabled && (!p->sample_rate_pause_enabled || p->sample_rate_pause_ms == 0)) {
+        atomic_store_explicit(&p->stabilization_frames_remaining, 0, memory_order_relaxed);
+    }
+    AV_DEBUG("output stabilization settings dac_warmup_enabled=%d dac_warmup_ms=%d sample_rate_pause_enabled=%d sample_rate_pause_ms=%d",
+             p->dac_warmup_enabled,
+             p->dac_warmup_ms,
+             p->sample_rate_pause_enabled,
+             p->sample_rate_pause_ms);
 }
 
 void av_player_set_replay_gain(av_player_t *p, int mode, int prevent_clip, double preamp_db) {
@@ -2599,11 +2952,18 @@ int av_player_list_devices(av_device_info_t *devices, int max_devices) {
 }
 
 int av_player_set_device(av_player_t *p, const char *device_name) {
+    const char *previous_device = p->device_name;
+    char previous_device_name[sizeof(p->device_name)];
+    strncpy(previous_device_name, previous_device ? previous_device : "", sizeof(previous_device_name) - 1);
+    previous_device_name[sizeof(previous_device_name) - 1] = '\0';
     if (device_name && device_name[0] != '\0') {
         strncpy(p->device_name, device_name, sizeof(p->device_name) - 1);
         p->device_name[sizeof(p->device_name) - 1] = '\0';
     } else {
         p->device_name[0] = '\0';
+    }
+    if (strcmp(previous_device_name, p->device_name) != 0) {
+        p->dac_warmup_done = 0;
     }
 
     output_config_t cfg = p->dec ? (output_config_t){0} : current_output_config(p);
@@ -2628,7 +2988,11 @@ int av_player_set_exclusive(av_player_t *p, int exclusive) {
              exclusive ? 1 : 0,
              p->exclusive_requested,
              p->bitperfect_requested);
+    int previous_exclusive_requested = p->exclusive_requested;
     p->exclusive_requested = exclusive ? 1 : 0;
+    if (!previous_exclusive_requested && p->exclusive_requested) {
+        p->dac_warmup_done = 0;
+    }
     if (!p->exclusive_requested) {
         p->bitperfect_requested = 0;
     }
@@ -2668,9 +3032,13 @@ int av_player_set_bitperfect(av_player_t *p, int bitperfect) {
              bitperfect ? 1 : 0,
              p->bitperfect_requested,
              p->exclusive_requested);
+    int previous_bitperfect_requested = p->bitperfect_requested;
     p->bitperfect_requested = bitperfect ? 1 : 0;
     if (p->bitperfect_requested) {
         p->exclusive_requested = 1;
+    }
+    if (!previous_bitperfect_requested && p->bitperfect_requested) {
+        p->dac_warmup_done = 0;
     }
 
     output_config_t cfg;
@@ -2751,7 +3119,7 @@ static int32_t dop_pack_s32(uint8_t marker, uint8_t dsd0, uint8_t dsd1) {
 }
 
 static int dop_write_packet(av_player_t *p, decoder_t *d, const AVPacket *pkt) {
-    int channels = d->codec_ctx->ch_layout.nb_channels;
+    int channels = decoder_channel_count(d);
     if (channels <= 0 || channels > AVPLAYER_MAX_DOP_CHANNELS) return AVERROR_INVALIDDATA;
     if (pkt->size <= 0 || (pkt->size % channels) != 0) return AVERROR_INVALIDDATA;
 
@@ -2800,6 +3168,7 @@ static int dop_write_packet(av_player_t *p, decoder_t *d, const AVPacket *pkt) {
 
     int written = ring_write(&p->ring, out, frames);
     free(out);
+    if (written == frames) player_log_first_ring_write(p, written);
     return written == frames ? 0 : AVERROR(EAGAIN);
 }
 
@@ -2874,6 +3243,7 @@ static int dop_write_wavpack_samples(av_player_t *p,
 
     int written = ring_write(&p->ring, out, frames);
     free(out);
+    if (written == frames) player_log_first_ring_write(p, written);
     return written == frames ? 0 : AVERROR(EAGAIN);
 }
 
@@ -3072,7 +3442,7 @@ static int av_player_decode_dop_step(av_player_t *p, decoder_t *d) {
     }
     update_packet_bitrate(p, d, d->pkt);
 
-    int frames = dop_packet_output_frames(d, d->pkt, d->codec_ctx->ch_layout.nb_channels);
+    int frames = dop_packet_output_frames(d, d->pkt, decoder_channel_count(d));
     if (frames < 0) {
         av_packet_unref(d->pkt);
         return AVPLAYER_DECODE_ERROR;
@@ -3142,6 +3512,7 @@ static int drain_sink(av_player_t *p, decoder_t *d) {
         // else: pending_frame already holds it, nothing to do.
         return AVERROR(EAGAIN);
     }
+    player_log_first_ring_write(p, written);
 
     // Frame written successfully; discard it.
     if (d->pending_frame) {
@@ -3173,6 +3544,11 @@ int av_player_decode_step(av_player_t *p) {
     // If paused, check if ring buffer still has data (don't decode more)
     if (atomic_load(&p->state) == AVPLAYER_STATE_PAUSED) {
         return AVPLAYER_DECODE_RING_FULL;  // tell Go to sleep briefly
+    }
+
+    if (p->dop_active &&
+        atomic_load_explicit(&p->stabilization_frames_remaining, memory_order_relaxed) > 0) {
+        return AVPLAYER_DECODE_RING_FULL;
     }
 
     decoder_t *d = p->dec;

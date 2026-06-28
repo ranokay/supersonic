@@ -225,7 +225,10 @@ func (m *Controller) ShowPopUpPlayQueue() {
 			for range t.C {
 				fyne.Do(func() {
 					now := time.Now().UnixMilli()
-					if m.popUpQueueLastUsed < now-120_000 /*2 min*/ {
+					if m.popUpQueue != nil && m.popUpQueueLastUsed < now-120_000 /*2 min*/ {
+						if m.popUpQueue.Visible() {
+							m.popUpQueue.Hide()
+						}
 						fynetooltip.DestroyPopUpToolTipLayer(m.popUpQueue)
 						m.popUpQueue = nil
 						m.popUpQueueList = nil
@@ -341,6 +344,9 @@ func (c *Controller) ShowSettingsDialog(themeUpdateCallbk func(), themeFiles map
 	}
 	dlg.OnPauseFadeSettingsChanged = func() {
 		c.App.LocalPlayer.SetPauseFade(c.App.Config.LocalPlayback.PauseFade)
+	}
+	dlg.OnOutputStabilizationSettingsChanged = func() {
+		c.App.LocalPlayer.SetOutputStabilizationOptions(backend.LocalPlaybackStabilizationOptions(c.App.Config.LocalPlayback))
 	}
 	dlg.OnAudioDeviceSettingChanged = func() {
 		c.App.LocalPlayer.SetAudioDevice(c.App.Config.LocalPlayback.AudioDeviceName)

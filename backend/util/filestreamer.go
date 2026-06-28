@@ -63,6 +63,11 @@ func (fs *FileStreamerServer) Serve() error {
 	return fs.server.Shutdown(ctx)
 }
 
+func (fs *FileStreamerServer) Stop(ctx context.Context) error {
+	fs.signalDone()
+	return fs.server.Shutdown(ctx)
+}
+
 func (fs *FileStreamerServer) signalDone() {
 	fs.doneOnce.Do(func() {
 		close(fs.done)

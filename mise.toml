@@ -31,7 +31,7 @@ run = "golangci-lint run"
 
 [tasks."tools:fyne"]
 description = "Install the Fyne packaging tool if missing"
-run = "command -v fyne >/dev/null || go install fyne.io/fyne/v2/cmd/fyne@latest"
+run = "command -v fyne >/dev/null || go install fyne.io/fyne/v2/cmd/fyne@v2.7.2"
 
 [tasks."package:macos"]
 description = "Create the macOS .app bundle"

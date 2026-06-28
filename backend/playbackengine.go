@@ -89,8 +89,9 @@ type playbackEngine struct {
 	// and reset this to -1
 	pendingTrackChangeNum int
 
-	pendingPlayerChange       bool
-	pendingPlayerChangeStatus player.Status
+	pendingPlayerChange         bool
+	pendingPlayerChangeStatus   player.Status
+	firstPlaybackPositionLogged bool
 
 	// set when restoring session state: track is conceptually loaded+paused
 	// but the local player hasn't been touched yet; cleared on Continue or playTrackAt
@@ -183,6 +184,7 @@ func (p *playbackEngine) registerPlayerCallbacks(pl player.BasePlayer) {
 		p.reportPlayback("paused")
 	})
 	pl.OnPlaying(func() {
+		audioDebugf("OnPlaying idx=%d", p.nowPlayingIdx)
 		p.playTimeStopwatch.Start()
 		p.startPollTimePos()
 		p.invokeNoArgCallbacks(p.onPlaying)
@@ -983,15 +985,28 @@ func (p *playbackEngine) nextPlayingIndex() int {
 }
 
 func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
+	span := startAudioDebugSpan("setTrack", "idx", idx, "next", next, "startTime", startTime)
+	defer span.Done()
+	if !next {
+		p.firstPlaybackPositionLogged = false
+	}
 	var item mediaprovider.MediaItem
 	var url string
 	if idx >= 0 {
 		item = p.getPlayQueueItemAt(idx)
+		urlSpan := startAudioDebugSpan("getStreamURL", "idx", idx)
 		url = p.getMediaURLForIdx(idx)
+		urlSpan.Done("hasURL", url != "")
 	}
-	track, isTrack := item.(*mediaprovider.Track)
+	var track *mediaprovider.Track
+	var isTrack bool
+	if item != nil {
+		track, isTrack = item.(*mediaprovider.Track)
+	}
 	if p.audiocache != nil && isTrack {
-		p.audiocache.CacheFile(item.Metadata().ID, p.getMediaURLForIdx(idx))
+		cacheSpan := startAudioDebugSpan("cacheFile", "idx", idx, "track", item.Metadata().ID)
+		p.audiocache.CacheFile(item.Metadata().ID, url)
+		cacheSpan.Done()
 	}
 
 	if urlP, ok := p.player.(player.URLPlayer); ok {
@@ -1001,6 +1016,9 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 			if isTrack && p.audiocache != nil {
 				if filepath := p.audiocache.PathForCachedFile(track.ID); filepath != "" {
 					url = filepath
+					audioDebugf("cache hit idx=%d path=%s", idx, filepath)
+				} else {
+					audioDebugf("cache miss idx=%d", idx)
 				}
 			}
 			if lpP, ok := p.player.(player.LocalPlayer); ok && !isTrack {
@@ -1023,9 +1041,15 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 			}
 		}
 		if next {
-			return urlP.SetNextFile(url, meta)
+			nextSpan := startAudioDebugSpan("SetNextFile", "idx", idx)
+			err := urlP.SetNextFile(url, meta)
+			nextSpan.Done("err", err)
+			return err
 		}
-		return urlP.PlayFile(url, meta, startTime)
+		playSpan := startAudioDebugSpan("PlayFile", "idx", idx)
+		err := urlP.PlayFile(url, meta, startTime)
+		playSpan.Done("err", err)
+		return err
 	} else if trP, ok := p.player.(player.TrackPlayer); ok {
 		var track *mediaprovider.Track
 		if idx >= 0 {
@@ -1035,9 +1059,15 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 			}
 		}
 		if next {
-			return trP.SetNextTrack(track)
+			nextSpan := startAudioDebugSpan("SetNextTrack", "idx", idx)
+			err := trP.SetNextTrack(track)
+			nextSpan.Done("err", err)
+			return err
 		}
-		return trP.PlayTrack(track, startTime)
+		playSpan := startAudioDebugSpan("PlayTrack", "idx", idx)
+		err := trP.PlayTrack(track, startTime)
+		playSpan.Done("err", err)
+		return err
 	}
 	panic("Unsupported player type")
 }
@@ -1193,6 +1223,10 @@ func (p *playbackEngine) stopPollTimePos() {
 
 func (p *playbackEngine) handleTimePosUpdate(seeked bool) {
 	s := p.PlaybackStatus()
+	if !p.firstPlaybackPositionLogged && s.TimePos > 0 {
+		p.firstPlaybackPositionLogged = true
+		audioDebugf("first nonzero playback position idx=%d pos=%.3f total=%.3f", p.nowPlayingIdx, s.TimePos, s.Duration)
+	}
 	var meta mediaprovider.MediaItemMetadata
 	if np := p.NowPlaying(); np != nil {
 		meta = np.Metadata()

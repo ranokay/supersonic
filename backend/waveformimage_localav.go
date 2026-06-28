@@ -58,7 +58,14 @@ func (w *WaveformImageGenerator) StartWaveformGeneration(item *mediaprovider.Tra
 				return
 			}
 			inputURL = srv.Addr()
-			go srv.Serve()
+			serveErr := make(chan error, 1)
+			go func() { serveErr <- srv.Serve() }()
+			defer func() {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer stopCancel()
+				_ = srv.Stop(stopCtx)
+				<-serveErr
+			}()
 			time.Sleep(10 * time.Millisecond)
 		}
 
@@ -129,7 +136,9 @@ func (w *WaveformImageGenerator) StartWaveformGeneration(item *mediaprovider.Tra
 
 		// 5. Generate waveform image (shared code)
 		generateWaveformImage(ctx, data, job)
+		job.lock.Lock()
 		job.done = true
+		job.lock.Unlock()
 	}()
 
 	return job

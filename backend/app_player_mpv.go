@@ -5,7 +5,6 @@ package backend
 import (
 	"fmt"
 
-	"github.com/dweymouth/supersonic/backend/player"
 	"github.com/dweymouth/supersonic/backend/player/mpv"
 )
 
@@ -19,10 +18,4 @@ func (a *App) initLocalPlayer() error {
 	}
 	a.LocalPlayer = p
 	return nil
-}
-
-// localPlayerSetup performs player-specific post-init setup (mpv variant).
-// Called by setupLocalPlayer after the common device/volume/EQ setup.
-func (a *App) localPlayerSetup(p player.LocalPlayer) {
-	// mpv has no extra setup beyond what setupLocalPlayer does.
 }

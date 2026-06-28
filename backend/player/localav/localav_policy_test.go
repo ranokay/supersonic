@@ -169,6 +169,79 @@ func TestDSDCarrierRateUsesDSDByteRate(t *testing.T) {
 	}
 }
 
+func TestOutputStabilizationUsesRenderSilenceWithoutAdvancingPosition(t *testing.T) {
+	src, err := os.ReadFile("av_player.c")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	code := string(src)
+
+	for _, want := range []string{
+		"stabilization_frames_remaining",
+		"player_render_stabilization_silence",
+		"return 1;",
+		"ring_read(&p->ring",
+		"player_schedule_output_stabilization",
+		"sample-rate switch pause scheduled",
+		"previous_sample_rate != p->output_sample_rate",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("expected output stabilization path to contain %q", want)
+		}
+	}
+
+	renderIdx := strings.Index(code, "player_render_stabilization_silence(p, output, frame_count, channels, bytes_per_frame)")
+	readIdx := strings.Index(code, "ring_read(&p->ring, output, (int)frame_count)")
+	if renderIdx < 0 || readIdx < 0 || renderIdx > readIdx {
+		t.Fatal("expected stabilization silence to run before ring_read so position does not advance")
+	}
+}
+
+func TestDoPStabilizationSilencePreservesMarkers(t *testing.T) {
+	src, err := os.ReadFile("av_player.c")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	code := string(src)
+
+	for _, want := range []string{
+		"player_fill_dop_silence",
+		"dop_pack_s32(marker, 0x69, 0x69)",
+		"p->dop_marker_phase ^= 1",
+		"p->dop_active &&",
+		"stabilization_frames_remaining",
+		"return AVPLAYER_DECODE_RING_FULL",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("expected DoP stabilization silence to contain %q", want)
+		}
+	}
+}
+
+func TestOutputDeviceReuseAndCoreAudioCaching(t *testing.T) {
+	src, err := os.ReadFile("av_player.c")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	code := string(src)
+
+	for _, want := range []string{
+		"player_can_reuse_output_device",
+		"reusing output device",
+		"active_device_request",
+		"coreaudio_fill_device_caps_cached",
+		"coreaudio_choose_physical_format_cached",
+		"coreaudio_choice_cache_rate == target_rate",
+		"coreaudio_choice_cache_channels == target_channels",
+		"coreaudio_choice_cache_bits == target_bits",
+		"coreaudio_choice_cache_dop == dop",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("expected output reuse/CoreAudio cache path to contain %q", want)
+		}
+	}
+}
+
 func TestUnsupportedDSDDoesNotReportBitPerfectWithoutRawDoP(t *testing.T) {
 	src, err := os.ReadFile("av_player.c")
 	if err != nil {

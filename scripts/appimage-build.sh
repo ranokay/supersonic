@@ -25,7 +25,7 @@ cat > Supersonic.AppDir/AppRun <<'EOF'
 SELF=$(readlink -f "$0")
 HERE=${SELF%/*}
 EXEC="${HERE}/usr/bin/supersonic"
-export LD_LIBRARY_PATH="/usr/lib64:/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib:${HERE}/usr/lib/"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:/usr/lib64:/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib"
 exec "${EXEC}"
 EOF
 
